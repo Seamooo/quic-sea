@@ -14,23 +14,6 @@ struct EcnCounts {
 }
 
 impl EcnCounts {
-    fn from_bytes(data: &[u8]) -> Result<(Self, usize), Error> {
-        let mut inc = 0;
-        let (ect0_count, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        let (ect1_count, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        let (ecn_ce_count, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        Ok((
-            Self {
-                ect0_count,
-                ect1_count,
-                ecn_ce_count,
-            },
-            inc,
-        ))
-    }
     fn from_datagram<T>(datagram: &mut T) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -53,20 +36,6 @@ struct AckRange {
 }
 
 impl AckRange {
-    fn from_bytes(data: &[u8]) -> Result<(Self, usize), Error> {
-        let mut inc = 0;
-        let (gap, tp) = decode_var_int(data)?;
-        inc += tp;
-        let (ack_range_length, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        Ok((
-            Self {
-                gap,
-                ack_range_length,
-            },
-            inc,
-        ))
-    }
     fn from_datagram<T>(datagram: &mut T) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -91,43 +60,6 @@ pub struct FrameAck {
 }
 
 impl FrameAck {
-    fn from_bytes(data: &[u8], type_byte: u8) -> Result<(Self, usize), Error> {
-        let mut inc = 0;
-        let (largest_acknowledged, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        let (ack_delay, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        let (ack_range_count, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        let (first_ack_range, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        // NOTE below converts from u64 to usize (assumes u32 max range)
-        // FIXME need to bounds check before allocation
-        let mut ack_range = Vec::with_capacity(ack_range_count as usize);
-        for _ in 0..ack_range_count {
-            let (tp_result, tp_inc) = AckRange::from_bytes(&data[inc..])?;
-            ack_range.push(tp_result);
-            inc += tp_inc;
-        }
-        let ecn_counts = if type_byte & 0x1 == 1 {
-            let (tp_result, tp_inc) = EcnCounts::from_bytes(&data[inc..])?;
-            inc += tp_inc;
-            Some(tp_result)
-        } else {
-            None
-        };
-        Ok((
-            Self {
-                largest_acknowledged,
-                ack_delay,
-                ack_range_count,
-                first_ack_range,
-                ack_range,
-                ecn_counts,
-            },
-            inc,
-        ))
-    }
     fn from_datagram<T>(datagram: &mut T, type_byte: u8) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -155,6 +87,9 @@ impl FrameAck {
             ecn_counts,
         })
     }
+    fn to_bytes(&self) -> error::Result<Vec<u8>> {
+        todo!();
+    }
 }
 
 #[derive(Debug)]
@@ -165,23 +100,6 @@ pub struct FrameResetStream {
 }
 
 impl FrameResetStream {
-    fn from_bytes(data: &[u8]) -> Result<(Self, usize), Error> {
-        let mut inc = 0;
-        let (stream_id, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        let (application_protocol_error_code, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        let (final_size, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        Ok((
-            Self {
-                stream_id,
-                application_protocol_error_code,
-                final_size,
-            },
-            inc,
-        ))
-    }
     fn from_datagram<T>(datagram: &mut T) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -204,20 +122,6 @@ pub struct FrameStopSending {
 }
 
 impl FrameStopSending {
-    fn from_bytes(data: &[u8]) -> Result<(Self, usize), Error> {
-        let mut inc = 0;
-        let (stream_id, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        let (application_protocol_error_code, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        Ok((
-            Self {
-                stream_id,
-                application_protocol_error_code,
-            },
-            inc,
-        ))
-    }
     fn from_datagram<T>(datagram: &mut T) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -239,24 +143,6 @@ pub struct FrameCrypto {
 }
 
 impl FrameCrypto {
-    fn from_bytes(data: &[u8]) -> Result<(Self, usize), Error> {
-        let mut inc = 0;
-        let (offset, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        let (length, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        let total_size = (length + offset) as usize;
-        let (crypto_data, tp) = decode_bytes(&data[inc..], total_size)?;
-        inc += tp;
-        Ok((
-            Self {
-                offset,
-                length,
-                crypto_data,
-            },
-            inc,
-        ))
-    }
     fn from_datagram<T>(datagram: &mut T) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -280,22 +166,6 @@ pub struct FrameNewToken {
 }
 
 impl FrameNewToken {
-    fn from_bytes(data: &[u8]) -> Result<(Self, usize), Error> {
-        let mut inc = 0;
-        let (token_length, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        // TODO handle overflow below for 32-bit implementations
-        let token_length_usize = token_length as usize;
-        let (token, tp) = decode_bytes(&data[inc..], token_length_usize)?;
-        inc += tp;
-        Ok((
-            Self {
-                token_length,
-                token,
-            },
-            inc,
-        ))
-    }
     fn from_datagram<T>(datagram: &mut T) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -319,43 +189,6 @@ pub struct FrameStream {
 }
 
 impl FrameStream {
-    fn from_bytes(data: &[u8], type_byte: u8) -> Result<(Self, usize), Error> {
-        // WARNING below expects that the length of the slice view sent contains
-        // exclusively the view from the second byte of the frame to the end of the packet
-        // any additional padding will break this function
-        let has_offset = type_byte & 0x04 == 1;
-        let has_length = type_byte & 0x02 == 1;
-        let is_fin = type_byte & 0x01 == 1;
-        let mut inc = 0;
-        let (stream_id, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        let offset = if has_offset {
-            let (tp_result, tp_inc) = decode_var_int(&data[inc..])?;
-            inc += tp_inc;
-            tp_result
-        } else {
-            0
-        };
-        let length = if has_length {
-            let (tp_result, tp_inc) = decode_var_int(&data[inc..])?;
-            inc += tp_inc;
-            tp_result
-        } else {
-            (data.len() - inc) as u64
-        };
-        let length_usize = length as usize;
-        let (stream_data, _) = decode_bytes(&data[inc..], length_usize)?;
-        Ok((
-            Self {
-                stream_id,
-                offset,
-                length,
-                stream_data,
-                is_fin,
-            },
-            inc,
-        ))
-    }
     fn from_datagram<T>(datagram: &mut T, type_byte: u8) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -394,10 +227,6 @@ pub struct FrameMaxData {
 }
 
 impl FrameMaxData {
-    fn from_bytes(data: &[u8]) -> Result<(Self, usize), Error> {
-        let (maximum_data, inc) = decode_var_int(data)?;
-        Ok((Self { maximum_data }, inc))
-    }
     fn from_datagram<T>(datagram: &mut T) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -414,20 +243,6 @@ pub struct FrameMaxStreamData {
 }
 
 impl FrameMaxStreamData {
-    fn from_bytes(data: &[u8]) -> Result<(Self, usize), Error> {
-        let mut inc = 0;
-        let (stream_id, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        let (maximum_stream_data, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        Ok((
-            Self {
-                stream_id,
-                maximum_stream_data,
-            },
-            inc,
-        ))
-    }
     fn from_datagram<T>(datagram: &mut T) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -448,18 +263,6 @@ pub struct FrameMaxStreams {
 }
 
 impl FrameMaxStreams {
-    fn from_bytes(data: &[u8], type_byte: u8) -> Result<(Self, usize), Error> {
-        let (maximum_streams, inc) = decode_var_int(data)?;
-        let is_unidirectional = type_byte & 0x01 == 1;
-        Ok((
-            Self {
-                maximum_streams,
-                is_unidirectional,
-            },
-            inc,
-        ))
-    }
-
     fn from_datagram<T>(datagram: &mut T, type_byte: u8) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -479,11 +282,6 @@ pub struct FrameDataBlocked {
 }
 
 impl FrameDataBlocked {
-    fn from_bytes(data: &[u8]) -> Result<(Self, usize), Error> {
-        let (maximum_data, inc) = decode_var_int(data)?;
-        Ok((Self { maximum_data }, inc))
-    }
-
     fn from_datagram<T>(datagram: &mut T) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -500,21 +298,6 @@ pub struct FrameStreamDataBlocked {
 }
 
 impl FrameStreamDataBlocked {
-    fn from_bytes(data: &[u8]) -> Result<(Self, usize), Error> {
-        let mut inc = 0;
-        let (stream_id, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        let (maximum_stream_data, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        Ok((
-            Self {
-                stream_id,
-                maximum_stream_data,
-            },
-            inc,
-        ))
-    }
-
     fn from_datagram<T>(datagram: &mut T) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -535,18 +318,6 @@ pub struct FrameStreamsBlocked {
 }
 
 impl FrameStreamsBlocked {
-    fn from_bytes(data: &[u8], type_byte: u8) -> Result<(Self, usize), Error> {
-        let (maximum_streams, inc) = decode_var_int(data)?;
-        let is_unidirectional_limit = type_byte & 0x01 == 1;
-        Ok((
-            Self {
-                maximum_streams,
-                is_unidirectional_limit,
-            },
-            inc,
-        ))
-    }
-
     fn from_datagram<T>(datagram: &mut T, type_byte: u8) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -570,41 +341,6 @@ pub struct FrameNewConnectionId {
 }
 
 impl FrameNewConnectionId {
-    fn from_bytes(data: &[u8]) -> Result<(Self, usize), Error> {
-        let mut inc = 0;
-        let (sequence_number, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        let (retire_prior_to, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        let length = data[inc];
-        inc += 1;
-        if 1 > length || length > 20 {
-            return Err(Error::FrameEncodingError);
-        }
-        let mut idx0 = 0u32;
-        let mut idx1 = 0u128;
-        for _ in 0..length {
-            idx0 <<= 8;
-            idx0 |= (idx1 >> 120) as u32;
-            // mask to prevent overflow
-            idx1 &= (1 << 120) - 1;
-            idx1 <<= 8;
-            idx1 |= u128::from(data[inc]);
-            inc += 1;
-        }
-        let (stateless_reset_token, tp) = u128::decode_from_bytes(&data[inc..])?;
-        inc += tp;
-        Ok((
-            Self {
-                sequence_number,
-                retire_prior_to,
-                length,
-                connection_id: U160 { idx0, idx1 },
-                stateless_reset_token,
-            },
-            inc,
-        ))
-    }
     fn from_datagram<T>(datagram: &mut T) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -633,11 +369,6 @@ pub struct FrameRetireConnectionId {
 }
 
 impl FrameRetireConnectionId {
-    fn from_bytes(data: &[u8]) -> Result<(Self, usize), Error> {
-        let (sequence_number, inc) = decode_var_int(data)?;
-        Ok((Self { sequence_number }, inc))
-    }
-
     fn from_datagram<T>(datagram: &mut T) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -653,11 +384,6 @@ pub struct FramePathChallenge {
 }
 
 impl FramePathChallenge {
-    fn from_bytes(data: &[u8]) -> Result<(Self, usize), Error> {
-        let (data, inc) = u64::decode_from_bytes(data)?;
-        Ok((Self { data }, inc))
-    }
-
     fn from_datagram<T>(datagram: &mut T) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -673,11 +399,6 @@ pub struct FramePathResponse {
 }
 
 impl FramePathResponse {
-    fn from_bytes(data: &[u8]) -> Result<(Self, usize), Error> {
-        let (data, inc) = u64::decode_from_bytes(data)?;
-        Ok((Self { data }, inc))
-    }
-
     fn from_datagram<T>(datagram: &mut T) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -697,34 +418,6 @@ pub struct FrameConnectionClose {
 }
 
 impl FrameConnectionClose {
-    fn from_bytes(data: &[u8], type_byte: u8) -> Result<(Self, usize), Error> {
-        let is_application_error = type_byte & 1 == 1;
-        let mut inc = 0;
-        let (error_code, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        let frame_type = if !is_application_error {
-            let (tp_res, tp_inc) = decode_var_int(&data[inc..])?;
-            inc += tp_inc;
-            Some(tp_res)
-        } else {
-            None
-        };
-        let (reason_phrase_length, tp) = decode_var_int(&data[inc..])?;
-        inc += tp;
-        let (reason_phrase, tp) = decode_bytes(&data[inc..], reason_phrase_length as usize)?;
-        inc += tp;
-        Ok((
-            Self {
-                error_code,
-                frame_type,
-                reason_phrase_length,
-                reason_phrase,
-                is_application_error,
-            },
-            inc,
-        ))
-    }
-
     fn from_datagram<T>(datagram: &mut T, type_byte: u8) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -770,6 +463,17 @@ pub enum Frame {
     PathResponse(FramePathResponse),
     ConnectionClose(FrameConnectionClose),
     HandshakeDone,
+}
+
+impl Frame {
+    fn to_bytes(&self) -> error::Result<Vec<u8>> {
+        Ok(match self {
+            Frame::Padding => vec![0x00],
+            Frame::Ping => vec![0x01],
+            Frame::Ack(ref x) => x.to_bytes()?,
+            _ => unimplemented!(),
+        })
+    }
 }
 
 pub fn deserialize_frame<T>(datagram: &mut T) -> error::Result<Frame>
@@ -839,5 +543,11 @@ where
         let frame = deserialize_frame(&mut peekable_df)?;
         rv.push(frame);
     }
+    Ok(rv)
+}
+
+pub fn serialize_frames(frames: &[Frame]) -> error::Result<Vec<u8>> {
+    let mut rv = Vec::<u8>::new();
+
     Ok(rv)
 }

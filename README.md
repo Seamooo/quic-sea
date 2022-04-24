@@ -31,8 +31,8 @@ Connection ids issued by this implementation of QUIC are fixed to size u64
 - [x] packet routing
 - [x] `TLS_AES_128_GCM_SHA256` cipher suite support
 - [ ] packet serialization
-- [ ] packet number spaces
-- [ ] packet number reconstruction
+- [x] packet number spaces
+- [x] packet number reconstruction
 - [ ] initial handshake
 - [ ] stream opening
 - [ ] stream closing

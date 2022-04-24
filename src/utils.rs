@@ -286,7 +286,7 @@ where
     let first_byte = stream
         .next()
         .unwrap_or(Err(Error::InternalError("missing first byte for varint")))?;
-    let n_shifts = usize::from(first_byte >> 6);
+    let n_shifts = (1usize << usize::from(first_byte >> 6)) - 1;
     let mut bytes = Vec::<u8>::with_capacity(n_shifts + 1);
     bytes.push(first_byte);
     let mut result = u64::from(first_byte & 0x3f);
@@ -301,14 +301,14 @@ where
     Ok((result, bytes))
 }
 
-pub fn var_int_from_stream<T>(stream: &mut T) -> Result<u64, Error>
+pub fn var_int_from_stream<T>(stream: &mut T) -> error::Result<u64>
 where
-    T: Iterator<Item = Result<u8, Error>>,
+    T: Iterator<Item = error::Result<u8>>,
 {
     let first_byte = stream
         .next()
         .unwrap_or(Err(Error::InternalError("missing first byte for varint")))?;
-    let n_shifts = usize::from(first_byte >> 6);
+    let n_shifts = (1usize << usize::from(first_byte >> 6)) - 1;
     let mut result = u64::from(first_byte & 0x3f);
     for _ in 0..n_shifts {
         result <<= 8;
@@ -372,7 +372,6 @@ where
             println!("failed at: {}", i);
             io::stdout().flush().unwrap();
         }
-        // rv.push(stream.next().unwrap_or(Err(Error::InternalError))?);
         rv.push(tp?);
     }
     Ok(rv)
@@ -424,4 +423,28 @@ pub fn make_result_stream<'a>(
     bytes: &'a [u8],
 ) -> impl Iterator<Item = error::Result<u8>> + 'a + Clone {
     bytes.iter().map(|x| -> error::Result<u8> { Ok(x.clone()) })
+}
+
+const VARINT_ONELEN_MAX: u64 = 0x3f;
+const VARINT_TWOLEN_MAX: u64 = 0x3fff;
+const VARINT_THREELEN_MAX: u64 = 0x3fff_ffff;
+const VARINT_FOURLEN_MAX: u64 = 0x3fff_ffff_ffff_ffff;
+
+pub fn encode_var_int(x: u64) -> error::Result<Vec<u8>> {
+    // TODO would be nice to use match syntax when exclusive match is no longer experimental
+    let n_shifts = if x <= VARINT_ONELEN_MAX {
+        0
+    } else if x <= VARINT_TWOLEN_MAX {
+        1
+    } else if x <= VARINT_THREELEN_MAX {
+        2
+    } else if x <= VARINT_FOURLEN_MAX {
+        3
+    } else {
+        return Err(Error::InternalError("var int overflow"));
+    };
+    let len = 1u64 << n_shifts;
+    let len_val: u64 = (n_shifts << 6) << (len - 1);
+    let bytes = (len_val | x).to_be_bytes();
+    Ok(bytes[(8 - len as usize)..].to_vec())
 }

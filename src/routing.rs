@@ -1,9 +1,9 @@
 use crate::connection::Connection;
-use crate::version;
 use crate::error::{self, Error};
 use crate::packet::{decode_packets, next_header_from_stream, Packet, PacketHeader, PacketType};
 use crate::tls;
 use crate::utils::{self, U160};
+use crate::version;
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::mpsc::{channel, Receiver, Sender};
