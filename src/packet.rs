@@ -1,11 +1,7 @@
-use crate::connection::Connection;
+use crate::connection::{Connection, PacketNumberSpace};
 use crate::error::{self, Error};
 use crate::frame::{deserialize_frames, Frame};
-use crate::utils::prelude::*;
-use crate::utils::{
-    self, fixed_len_dcid_from_stream, var_bytes_from_stream, var_u160_from_stream,
-    var_u32_from_stream,
-};
+use crate::utils::{self, prelude::*, var_bytes_from_stream, var_u160_from_stream};
 
 const VERSION_NEGOTIATION_VERSION_VALUE: u32 = 0;
 
@@ -202,7 +198,8 @@ pub struct PacketInitial {
 }
 
 impl PacketInitial {
-    pub fn from_stream<T>(stream: &mut T, connection: &Connection) -> Result<Self, Error>
+    const PN_SPACE: PacketNumberSpace = PacketNumberSpace::Initial;
+    pub fn from_stream<T>(stream: &mut T, connection: &Connection) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>> + Clone,
     {
@@ -219,11 +216,7 @@ impl PacketInitial {
         let packet_number_length = header.packet_number_length()?;
         remove_pn_protection(&mut packet_number_bytes_protected, &mask)?;
         let packet_number_bytes = packet_number_bytes_protected[..packet_number_length].to_vec();
-        let packet_number_lsb = var_u32_from_stream(
-            &mut utils::make_result_stream(&packet_number_bytes[..]),
-            packet_number_length,
-        )?;
-        let packet_number = connection.reconstruct_pn_initial(packet_number_lsb);
+        let packet_number = connection.reconstruct_pn(&packet_number_bytes[..], Self::PN_SPACE)?;
         let protected_frame_data =
             var_bytes_from_stream(stream, length as usize - packet_number_length)?;
         // create associated data
@@ -263,6 +256,7 @@ pub struct PacketZeroRtt {
 }
 
 impl PacketZeroRtt {
+    const PN_SPACE: PacketNumberSpace = PacketNumberSpace::Application;
     pub fn from_stream<T>(stream: &mut T, connection: &Connection) -> error::Result<Self>
     where
         T: Iterator<Item = Result<u8, Error>> + Clone,
@@ -277,11 +271,7 @@ impl PacketZeroRtt {
         let packet_number_length = header.packet_number_length()?;
         remove_pn_protection(&mut packet_number_bytes_protected, &mask)?;
         let packet_number_bytes = packet_number_bytes_protected[..packet_number_length].to_vec();
-        let packet_number_lsb = var_u32_from_stream(
-            &mut utils::make_result_stream(&packet_number_bytes[..]),
-            packet_number_length,
-        )?;
-        let packet_number = connection.reconstruct_pn_initial(packet_number_lsb);
+        let packet_number = connection.reconstruct_pn(&packet_number_bytes[..], Self::PN_SPACE)?;
         let protected_frame_data =
             var_bytes_from_stream(stream, length as usize - packet_number_length)?;
         // create associated data
@@ -317,6 +307,7 @@ pub struct PacketHandshake {
 }
 
 impl PacketHandshake {
+    const PN_SPACE: PacketNumberSpace = PacketNumberSpace::Handshake;
     pub fn from_stream<T>(stream: &mut T, connection: &Connection) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>> + Clone,
@@ -332,11 +323,7 @@ impl PacketHandshake {
         let packet_number_length = header.packet_number_length()?;
         remove_pn_protection(&mut packet_number_bytes, &mask)?;
         let packet_number_vec = packet_number_bytes[..packet_number_length].to_vec();
-        let packet_number_lsb = var_u32_from_stream(
-            &mut utils::make_result_stream(&packet_number_vec[..]),
-            packet_number_length,
-        )?;
-        let packet_number = connection.reconstruct_pn_initial(packet_number_lsb);
+        let packet_number = connection.reconstruct_pn(&packet_number_bytes[..], Self::PN_SPACE)?;
         let protected_frame_data =
             var_bytes_from_stream(stream, length as usize - packet_number_length)?;
         // create associated data
@@ -441,7 +428,7 @@ impl ShortPacketHeader {
     where
         T: Iterator<Item = error::Result<u8>>,
     {
-        let destination_connection_id = fixed_len_dcid_from_stream(stream)?;
+        let destination_connection_id = utils::fixed_len_dcid_from_stream(stream)?;
         Ok(Self {
             header_byte,
             destination_connection_id,
@@ -512,6 +499,7 @@ pub struct PacketOneRtt {
 }
 
 impl PacketOneRtt {
+    const PN_SPACE: PacketNumberSpace = PacketNumberSpace::Application;
     pub fn from_stream<T>(stream: &mut T, connection: &Connection) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>> + Clone,
@@ -526,11 +514,7 @@ impl PacketOneRtt {
         let packet_number_length = header.packet_number_length()?;
         remove_pn_protection(&mut packet_number_bytes_protected, &mask)?;
         let packet_number_bytes = packet_number_bytes_protected[..packet_number_length].to_vec();
-        let packet_number_lsb = var_u32_from_stream(
-            &mut utils::make_result_stream(&packet_number_bytes[..]),
-            packet_number_length,
-        )?;
-        let packet_number = connection.reconstruct_pn_initial(packet_number_lsb);
+        let packet_number = connection.reconstruct_pn(&packet_number_bytes[..], Self::PN_SPACE)?;
         let protected_frame_data = utils::all_bytes_from_stream(stream)?;
         let associated_data = [&header.to_bytes(), &packet_number_bytes[..]].concat();
         let frame_data = connection.decrypt_remote_payload(
