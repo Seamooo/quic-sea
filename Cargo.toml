@@ -1,0 +1,16 @@
+[package]
+name = "quic-sea"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+hkdf = "0.12"
+sha2 = "0.10"
+rustls = {version="0.20", features = ["quic"]}
+openssl = {version="0.10", features = ["vendored"]}
+hex-literal = "0.3"
+log = "0.4"
+crypto-common = "0.1"
+ring = "0.16"

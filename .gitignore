@@ -1,0 +1,6 @@
+/target
+Cargo.lock
+# any in-repo logging should not be tracked
+*.log
+# output of prettify_bin should not be tracked
+*.pretty
