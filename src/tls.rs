@@ -1,13 +1,11 @@
 use crate::error::{self, Error};
 use crate::utils::U160;
-use hex_literal::hex;
+use crate::version;
 use hkdf::Hkdf;
 use openssl::rand::rand_bytes;
 use openssl::symm::{decrypt_aead, encrypt, encrypt_aead, Cipher};
 use sha2::Sha256;
 
-pub const KDF_INITIAL_SALT_V1: &'static [u8; 20] =
-    &hex!("38762cf7f55934b34d179ae6a4c80cadccbb7f0a");
 pub const SERVER_INITIAL_SECRET_LABEL: &'static [u8; 9] = b"server in";
 pub const CLIENT_INITIAL_SECRET_LABEL: &'static [u8; 9] = b"client in";
 pub const HEADER_PROTECTION_LABEL: &'static [u8; 7] = b"quic hp";
@@ -29,19 +27,6 @@ impl ProtectionProtocol {
             ProtectionProtocol::Aes128GcmSha256 => 16,
             ProtectionProtocol::Aes128CcmSha256 => 16,
             _ => unimplemented!(),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum Version {
-    V1,
-}
-
-impl Version {
-    fn get_kdf_initial_salt(&self) -> &'static [u8] {
-        match self {
-            Version::V1 => KDF_INITIAL_SALT_V1,
         }
     }
 }
@@ -92,7 +77,7 @@ impl Secrets {
     pub fn from_initial(
         is_server: bool,
         cid_bytes: &[u8],
-        version: Version,
+        version: version::Version,
     ) -> error::Result<Self> {
         let (initial_secret, _) =
             Hkdf::<Sha256>::extract(Some(version.get_kdf_initial_salt()), cid_bytes);
@@ -465,8 +450,10 @@ mod test {
         let expected_secret =
             hex!("7db5df06e7a69e432496adedb0085192 3595221596ae2ae9fb8115c1e9ed0a44");
         let initial_cid_bytes = hex!("8394c8f03e515708");
-        let (secret, _) =
-            Hkdf::<Sha256>::extract(Some(super::KDF_INITIAL_SALT_V1), &initial_cid_bytes);
+        let (secret, _) = Hkdf::<Sha256>::extract(
+            Some(crate::version::KDF_INITIAL_SALT_V1),
+            &initial_cid_bytes,
+        );
         assert_eq!(secret[..], expected_secret[..]);
     }
 

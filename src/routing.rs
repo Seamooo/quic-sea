@@ -1,9 +1,9 @@
 use crate::connection::Connection;
+use crate::version;
 use crate::error::{self, Error};
 use crate::packet::{decode_packets, next_header_from_stream, Packet, PacketHeader, PacketType};
 use crate::tls;
 use crate::utils::{self, U160};
-use rustls::quic as quicls;
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -104,7 +104,7 @@ impl InternalQuicSocket {
             if ret_datagram {
                 return Ok(datagram);
             } else {
-                self.route_datagram(datagram);
+                self.route_datagram(datagram).unwrap();
             }
         }
     }
@@ -147,7 +147,7 @@ impl InternalQuicSocket {
         Ok(rv)
     }
 
-    pub fn connect<A>(&self, addresses: A) -> std::io::Result<U160>
+    pub fn connect<A>(&self, _addresses: A) -> std::io::Result<U160>
     where
         A: ToSocketAddrs,
     {
@@ -161,7 +161,7 @@ impl InternalQuicSocket {
         let header = next_header_from_stream(&mut stream).unwrap();
         let connection = Connection::new(
             true,
-            tls::Version::V1,
+            version::Version::V1,
             header.get_destination_id(),
             header.get_destination_id_length() as usize,
         )
@@ -180,9 +180,9 @@ impl InternalQuicSocket {
                 }
             }
         }();
-        let connection_ref = self.streams.read().unwrap().get(&rv).unwrap();
-        unimplemented!();
-        Ok(rv)
+        let _connection_ref = self.streams.read().unwrap().get(&rv).unwrap();
+        todo!();
+        // Ok(rv)
     }
 
     pub fn set_log_traffic(&mut self, log_traffic_flag: bool) {

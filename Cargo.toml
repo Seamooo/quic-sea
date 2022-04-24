@@ -8,9 +8,10 @@ edition = "2021"
 [dependencies]
 hkdf = "0.12"
 sha2 = "0.10"
-rustls = {version="0.20", features = ["quic"]}
 openssl = {version="0.10", features = ["vendored"]}
 hex-literal = "0.3"
 log = "0.4"
 crypto-common = "0.1"
+
+[dev-dependencies]
 ring = "0.16"

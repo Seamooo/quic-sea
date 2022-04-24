@@ -1,6 +1,7 @@
 use crate::error;
 use crate::tls;
 use crate::utils::{self, prelude::*};
+use crate::version;
 
 #[derive(Debug)]
 pub struct Connection {
@@ -16,7 +17,7 @@ pub struct Connection {
 impl Connection {
     pub fn new(
         is_server: bool,
-        version: tls::Version,
+        version: version::Version,
         dcid: U160,
         dcid_len: usize,
     ) -> error::Result<Self> {
@@ -65,5 +66,9 @@ impl Connection {
         self.tls_secrets
             .remote
             .decrypt_payload(payload, associated_data, packet_number)
+    }
+    pub fn reconstruct_pn_initial(&self, packet_number_lsb: u32) -> u64 {
+        // TODO implement proper packet number reconstruction
+        u64::from(packet_number_lsb)
     }
 }

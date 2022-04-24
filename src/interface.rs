@@ -46,5 +46,5 @@ impl QuicSocket {
             socket: self.socket.clone(),
         })
     }
-    pub fn set_log_traffic(&self, log_traffic_flag: bool) {}
+    pub fn set_log_traffic(&self, _log_traffic_flag: bool) {}
 }

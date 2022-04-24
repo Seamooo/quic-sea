@@ -9,26 +9,6 @@ pub struct U160 {
     pub idx1: u128,
 }
 
-#[derive(Debug, Copy, Clone)]
-pub struct U2048 {
-    pub idx0: u128,
-    pub idx1: u128,
-    pub idx2: u128,
-    pub idx3: u128,
-    pub idx4: u128,
-    pub idx5: u128,
-    pub idx6: u128,
-    pub idx7: u128,
-    pub idx8: u128,
-    pub idx9: u128,
-    pub idx10: u128,
-    pub idx11: u128,
-    pub idx12: u128,
-    pub idx13: u128,
-    pub idx14: u128,
-    pub idx15: u128,
-}
-
 impl From<u64> for U160 {
     fn from(val: u64) -> Self {
         let idx1 = u128::from(val);
@@ -55,6 +35,12 @@ impl U160 {
         bytes.rotate_left(Self::BITS / 8 - len);
         bytes[..len].to_vec()
     }
+    pub fn zero() -> Self {
+        Self {
+            idx0: 0u32,
+            idx1: 0u128,
+        }
+    }
 }
 
 pub mod prelude {
@@ -62,7 +48,6 @@ pub mod prelude {
     use crate::error::Error;
 
     pub use super::U160;
-    pub use super::U2048;
 
     pub trait DecodeFromBytes {
         type Output;

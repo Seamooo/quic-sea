@@ -3,18 +3,16 @@ use crate::error::{self, Error};
 use crate::frame::{deserialize_frames, Frame};
 use crate::utils::prelude::*;
 use crate::utils::{
-    self, all_bytes_from_stream, fixed_len_dcid_from_stream, var_bytes_from_stream,
-    var_int_from_stream, var_u160_from_stream, var_u32_from_stream,
+    self, fixed_len_dcid_from_stream, var_bytes_from_stream, var_u160_from_stream,
+    var_u32_from_stream,
 };
 
+const VERSION_NEGOTIATION_VERSION_VALUE: u32 = 0;
+
 #[derive(Debug)]
-pub struct PacketVersionNegotiation {
-    version: u32,
-    destination_connection_id_length: u8,
-    destination_connection_id: U2048,
-    source_connection_id_length: u8,
-    source_connection_id: U2048,
-    supported_version: u8,
+pub struct VersionNegotiationHeaderUnionFields {
+    pub destination_connection_id: Vec<u8>,
+    pub source_connection_id: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -25,6 +23,7 @@ pub struct LongPacketHeader {
     pub destination_connection_id: U160,
     pub source_connection_id_length: u8,
     pub source_connection_id: U160,
+    version_negotiation: Option<VersionNegotiationHeaderUnionFields>,
     is_protected: bool,
 }
 
@@ -45,29 +44,65 @@ impl LongPacketHeader {
         T: Iterator<Item = error::Result<u8>>,
     {
         let version = u32::from_datagram(stream)?;
-        let destination_connection_id_length = u8::from_datagram(stream)?;
-        if destination_connection_id_length > 20 {
-            return Err(Error::InternalError(
-                "invalid destination connection id length",
-            ));
-        }
-        let destination_connection_id =
-            var_u160_from_stream(stream, destination_connection_id_length)?;
-        let source_connection_id_length = u8::from_datagram(stream)?;
-        if source_connection_id_length > 20 {
-            return Err(Error::InternalError("invalid source connection id length"));
-        }
-        let source_connection_id = var_u160_from_stream(stream, source_connection_id_length)?;
-        Ok(Self {
+        let is_version_negotiation = version == VERSION_NEGOTIATION_VERSION_VALUE;
+        let (
+            version_negotiation,
+            destination_connection_id_length,
+            destination_connection_id,
+            source_connection_id_length,
+            source_connection_id,
+        ) = if !is_version_negotiation {
+            let dcid_len = u8::from_datagram(stream)?;
+            if dcid_len > 20 {
+                return Err(Error::InternalError(
+                    "invalid destination connection id length",
+                ));
+            }
+            let dcid = var_u160_from_stream(stream, dcid_len)?;
+            let scid_len = u8::from_datagram(stream)?;
+            // version negotiation must not be limited to the supported version's id length rules
+            if scid_len > 20 {
+                return Err(Error::InternalError("invalid source connection id length"));
+            }
+            let scid = var_u160_from_stream(stream, scid_len)?;
+            (None, dcid_len, dcid, scid_len, scid)
+        } else {
+            // version negotiation must not be limited to the supported version's id length rules
+            let dcid_len = u8::from_datagram(stream)?;
+            let dcid = U160::zero();
+            let destination_connection_id = var_bytes_from_stream(stream, dcid_len as usize)?;
+            let scid_len = u8::from_datagram(stream)?;
+            let scid = U160::zero();
+            let source_connection_id = var_bytes_from_stream(stream, scid_len as usize)?;
+            (
+                Some(VersionNegotiationHeaderUnionFields {
+                    destination_connection_id,
+                    source_connection_id,
+                }),
+                dcid_len,
+                dcid,
+                scid_len,
+                scid,
+            )
+        };
+        let mut rv = Self {
             header_byte,
             version,
             destination_connection_id_length,
             destination_connection_id,
             source_connection_id_length,
             source_connection_id,
-            // FIXME below is not true for retry packets
+            version_negotiation,
             is_protected: true,
-        })
+        };
+        // explicitly handle retry and version negotiation packets being unprotected
+        let is_protected = match rv.packet_type() {
+            PacketType::Retry => false,
+            PacketType::VersionNegotiation => false,
+            _ => true,
+        };
+        rv.is_protected = is_protected;
+        Ok(rv)
     }
     pub fn to_bytes(&self) -> Vec<u8> {
         [
@@ -90,9 +125,7 @@ impl LongPacketHeader {
 
     pub fn remove_protection(&mut self, mask: &[u8; 5]) {
         if self.is_protected {
-            println!("header_byte before: {:x?}", self.header_byte);
             self.header_byte ^= mask[0] & 0x0f;
-            println!("header_byte after: {:x?}", self.header_byte);
             self.is_protected = false;
         }
     }
@@ -108,18 +141,54 @@ impl LongPacketHeader {
     }
 
     pub fn packet_type(&self) -> PacketType {
-        let type_bytes = (self.header_byte & ((1 << 6) - 1)) >> 4;
-        match type_bytes {
-            0x00 => PacketType::Initial,
-            0x01 => PacketType::ZeroRtt,
-            0x02 => PacketType::Handshake,
-            0x03 => PacketType::Retry,
-            _ => unreachable!(),
+        match self.version {
+            VERSION_NEGOTIATION_VERSION_VALUE => PacketType::VersionNegotiation,
+            _ => {
+                let type_bits = (self.header_byte & ((1 << 6) - 1)) >> 4;
+                match type_bits {
+                    0x00 => PacketType::Initial,
+                    0x01 => PacketType::ZeroRtt,
+                    0x02 => PacketType::Handshake,
+                    0x03 => PacketType::Retry,
+                    _ => unreachable!(),
+                }
+            }
         }
     }
 }
 
-use std::io::{self, Write};
+#[derive(Debug)]
+pub struct PacketVersionNegotiation {
+    header: LongPacketHeader,
+    supported_versions: Vec<u32>,
+}
+
+impl PacketVersionNegotiation {
+    pub fn from_stream<T>(stream: &mut T) -> error::Result<Self>
+    where
+        T: Iterator<Item = error::Result<u8>> + Clone,
+    {
+        let header_byte = u8::from_datagram(stream)?;
+        let header = LongPacketHeader::from_stream(stream, header_byte)?;
+        let supported_versions_bytes = utils::all_bytes_from_stream(stream)?;
+        if supported_versions_bytes.len() & 0x03 != 0x00 {
+            return Err(Error::InternalError(
+                "\"supported versions\" is not qword aligned",
+            ));
+        }
+        let mut supported_versions_results = supported_versions_bytes
+            .chunks(4)
+            .map(|x| u32::from_datagram(&mut utils::make_result_stream(x)));
+        let mut supported_versions = Vec::<u32>::with_capacity(supported_versions_results.len());
+        while let Some(x) = supported_versions_results.next() {
+            supported_versions.push(x?);
+        }
+        Ok(Self {
+            header,
+            supported_versions,
+        })
+    }
+}
 
 #[derive(Debug)]
 pub struct PacketInitial {
@@ -127,18 +196,12 @@ pub struct PacketInitial {
     token_length: u64,
     token: Vec<u8>,
     length: u64,
-    packet_number: u32,
+    packet_number_bytes: Vec<u8>,
+    packet_number: u64,
     packet_payload: Vec<Frame>,
 }
 
 impl PacketInitial {
-    pub fn from_headerless_stream<T>(
-        stream: &mut T,
-        header: LongPacketHeader,
-    ) -> error::Result<Self> {
-        // TODO remove this method
-        todo!();
-    }
     pub fn from_stream<T>(stream: &mut T, connection: &Connection) -> Result<Self, Error>
     where
         T: Iterator<Item = error::Result<u8>> + Clone,
@@ -148,26 +211,19 @@ impl PacketInitial {
         let (token_length, token_length_bytes) = utils::var_int_with_bytes_from_stream(stream)?;
         let token = var_bytes_from_stream(stream, token_length as usize)?;
         let (length, length_bytes) = utils::var_int_with_bytes_from_stream(stream)?;
-        println!("length: {:?}", length);
         // get largest potential packet number
-        let mut packet_number_bytes = var_bytes_from_stream(stream, 4)?;
+        let mut packet_number_bytes_protected = var_bytes_from_stream(stream, 4)?;
         let mut offset_stream = stream.clone();
         let mask = connection.get_remote_hp_mask(&mut offset_stream)?;
-        println!("mask: {:X?}", mask);
         header.remove_protection(&mask);
-        println!("header: {:#02X?}", header);
-        println!(
-            "packet number length: {:?}",
-            header.packet_number_length().unwrap()
-        );
         let packet_number_length = header.packet_number_length()?;
-        remove_pn_protection(&mut packet_number_bytes, &mask)?;
-        let packet_number = var_u32_from_stream(
-            &mut utils::make_result_stream(&packet_number_bytes[..packet_number_length]),
+        remove_pn_protection(&mut packet_number_bytes_protected, &mask)?;
+        let packet_number_bytes = packet_number_bytes_protected[..packet_number_length].to_vec();
+        let packet_number_lsb = var_u32_from_stream(
+            &mut utils::make_result_stream(&packet_number_bytes[..]),
             packet_number_length,
         )?;
-        println!("packet number: {}", packet_number);
-        io::stdout().flush().unwrap();
+        let packet_number = connection.reconstruct_pn_initial(packet_number_lsb);
         let protected_frame_data =
             var_bytes_from_stream(stream, length as usize - packet_number_length)?;
         // create associated data
@@ -176,13 +232,13 @@ impl PacketInitial {
             &token_length_bytes[..],
             &token[..],
             &length_bytes[..],
-            &packet_number_bytes[..packet_number_length],
+            &packet_number_bytes[..],
         ]
         .concat();
         let frame_data = connection.decrypt_remote_payload(
             &protected_frame_data[..],
             &associated_data[..],
-            u64::from(packet_number),
+            packet_number,
         )?;
         let packet_payload = deserialize_frames(&mut utils::make_result_stream(&frame_data[..]))?;
         Ok(Self {
@@ -190,6 +246,7 @@ impl PacketInitial {
             token_length,
             token,
             length,
+            packet_number_bytes,
             packet_number,
             packet_payload,
         })
@@ -200,41 +257,53 @@ impl PacketInitial {
 pub struct PacketZeroRtt {
     header: LongPacketHeader,
     length: u64,
-    packet_number: u32,
+    packet_number_bytes: Vec<u8>,
+    packet_number: u64,
     packet_payload: Vec<Frame>,
 }
 
 impl PacketZeroRtt {
-    pub fn from_headerless_stream<T>(
-        stream: &mut T,
-        header: LongPacketHeader,
-    ) -> Result<Self, Error>
+    pub fn from_stream<T>(stream: &mut T, connection: &Connection) -> error::Result<Self>
     where
-        T: Iterator<Item = Result<u8, Error>>,
+        T: Iterator<Item = Result<u8, Error>> + Clone,
     {
-        let length = var_int_from_stream(stream)?;
+        let header_byte = u8::from_datagram(stream)?;
+        let mut header = LongPacketHeader::from_stream(stream, header_byte)?;
+        let (length, length_bytes) = utils::var_int_with_bytes_from_stream(stream)?;
+        let mut packet_number_bytes_protected = var_bytes_from_stream(stream, 4)?;
+        let mut offset_stream = stream.clone();
+        let mask = connection.get_remote_hp_mask(&mut offset_stream)?;
+        header.remove_protection(&mask);
         let packet_number_length = header.packet_number_length()?;
-        let packet_number = var_u32_from_stream(stream, packet_number_length)?;
-        let frame_data = var_bytes_from_stream(stream, length as usize)?;
-        let packet_payload = deserialize_frames(
-            &mut frame_data
-                .iter()
-                .map(|x| -> error::Result<u8> { Ok(x.clone()) }),
+        remove_pn_protection(&mut packet_number_bytes_protected, &mask)?;
+        let packet_number_bytes = packet_number_bytes_protected[..packet_number_length].to_vec();
+        let packet_number_lsb = var_u32_from_stream(
+            &mut utils::make_result_stream(&packet_number_bytes[..]),
+            packet_number_length,
         )?;
+        let packet_number = connection.reconstruct_pn_initial(packet_number_lsb);
+        let protected_frame_data =
+            var_bytes_from_stream(stream, length as usize - packet_number_length)?;
+        // create associated data
+        let associated_data = [
+            &header.to_bytes()[..],
+            &length_bytes[..],
+            &packet_number_bytes[..packet_number_length],
+        ]
+        .concat();
+        let frame_data = connection.decrypt_remote_payload(
+            &protected_frame_data[..],
+            &associated_data[..],
+            packet_number,
+        )?;
+        let packet_payload = deserialize_frames(&mut utils::make_result_stream(&frame_data[..]))?;
         Ok(Self {
             header,
             length,
+            packet_number_bytes,
             packet_number,
             packet_payload,
         })
-    }
-    pub fn from_stream<T>(stream: &mut T, header_byte: u8) -> Result<Self, Error>
-    where
-        T: Iterator<Item = Result<u8, Error>>,
-    {
-        let header = LongPacketHeader::from_stream(stream, header_byte)?;
-        // TODO remove header protection before proceeding
-        Self::from_headerless_stream(stream, header)
     }
 }
 
@@ -242,41 +311,54 @@ impl PacketZeroRtt {
 pub struct PacketHandshake {
     header: LongPacketHeader,
     length: u64,
-    packet_number: u32,
+    packet_number_bytes: Vec<u8>,
+    packet_number: u64,
     packet_payload: Vec<Frame>,
 }
 
 impl PacketHandshake {
-    pub fn from_headerless_stream<T>(
-        stream: &mut T,
-        header: LongPacketHeader,
-    ) -> error::Result<Self>
+    pub fn from_stream<T>(stream: &mut T, connection: &Connection) -> error::Result<Self>
     where
-        T: Iterator<Item = error::Result<u8>>,
+        T: Iterator<Item = error::Result<u8>> + Clone,
     {
-        let length = var_int_from_stream(stream)?;
+        let header_byte = u8::from_datagram(stream)?;
+        let mut header = LongPacketHeader::from_stream(stream, header_byte)?;
+        let (length, length_bytes) = utils::var_int_with_bytes_from_stream(stream)?;
+        let mut packet_number_bytes = var_bytes_from_stream(stream, 4)?;
+        let mut offset_stream = stream.clone();
+        // assumes packet is encoded by the remote
+        let mask = connection.get_remote_hp_mask(&mut offset_stream)?;
+        header.remove_protection(&mask);
         let packet_number_length = header.packet_number_length()?;
-        let packet_number = var_u32_from_stream(stream, packet_number_length)?;
-        let frame_data = var_bytes_from_stream(stream, length as usize)?;
-        let packet_payload = deserialize_frames(
-            &mut frame_data
-                .iter()
-                .map(|x| -> error::Result<u8> { Ok(x.clone()) }),
+        remove_pn_protection(&mut packet_number_bytes, &mask)?;
+        let packet_number_vec = packet_number_bytes[..packet_number_length].to_vec();
+        let packet_number_lsb = var_u32_from_stream(
+            &mut utils::make_result_stream(&packet_number_vec[..]),
+            packet_number_length,
         )?;
+        let packet_number = connection.reconstruct_pn_initial(packet_number_lsb);
+        let protected_frame_data =
+            var_bytes_from_stream(stream, length as usize - packet_number_length)?;
+        // create associated data
+        let associated_data = [
+            &header.to_bytes()[..],
+            &length_bytes[..],
+            &packet_number_vec[..],
+        ]
+        .concat();
+        let frame_data = connection.decrypt_remote_payload(
+            &protected_frame_data[..],
+            &associated_data[..],
+            packet_number,
+        )?;
+        let packet_payload = deserialize_frames(&mut utils::make_result_stream(&frame_data[..]))?;
         Ok(Self {
             header,
             length,
+            packet_number_bytes: packet_number_vec,
             packet_number,
             packet_payload,
         })
-    }
-    pub fn from_stream<T>(stream: &mut T, header_byte: u8) -> error::Result<Self>
-    where
-        T: Iterator<Item = error::Result<u8>>,
-    {
-        let header = LongPacketHeader::from_stream(stream, header_byte)?;
-        // TODO remove header protection before proceeding
-        Self::from_headerless_stream(stream, header)
     }
 }
 
@@ -292,56 +374,58 @@ pub struct PacketRetry {
 }
 
 impl PacketRetry {
-    pub fn from_stream<T>(stream: &mut T) -> Result<Self, Error>
+    pub fn from_stream<T>(_stream: &mut T) -> error::Result<Self>
     where
-        T: Iterator<Item = Result<u8, Error>>,
+        T: Iterator<Item = error::Result<u8>>,
     {
-        let version = u32::from_datagram(stream)?;
-        let destination_connection_id_length = u8::from_datagram(stream)?;
-        if destination_connection_id_length > 20 {
-            return Err(Error::InternalError(
-                "invalid destination connection id length",
-            ));
-        }
-        let destination_connection_id =
-            var_u160_from_stream(stream, destination_connection_id_length)?;
-        let source_connection_id_length = u8::from_datagram(stream)?;
-        if source_connection_id_length > 20 {
-            return Err(Error::InternalError("Invalid source connection id length"));
-        }
-        let source_connection_id = var_u160_from_stream(stream, source_connection_id_length)?;
-        let remaining_results = stream.collect::<Vec<_>>();
-        let errs = remaining_results
-            .iter()
-            .filter(|x| x.is_err())
-            .map(|x| x.clone().err().unwrap())
-            .collect::<Vec<_>>();
-        if errs.len() > 0 {
-            return Err(errs[0].clone());
-        }
-        let mut retry_token = remaining_results.into_iter().flatten().collect::<Vec<_>>();
-        // check if there's room for integrity tag
-        if retry_token.len() < 16 {
-            return Err(Error::InternalError("Invalid retry token length"));
-        }
-        let mut retry_integrity_bytes = [0u8; 16];
-        for i in 0..16 {
-            let tp = match retry_token.pop() {
-                Some(x) => Ok(x),
-                None => Err(Error::InternalError("missing retry integrity")),
-            }?;
-            retry_integrity_bytes[15 - i] = tp;
-        }
-        let (retry_integrity_tag, _) = u128::decode_from_bytes(&retry_integrity_bytes)?;
-        Ok(Self {
-            version,
-            destination_connection_id_length,
-            destination_connection_id,
-            source_connection_id_length,
-            source_connection_id,
-            retry_token,
-            retry_integrity_tag,
-        })
+        // TODO implement this after retry packet integrity implemented
+        todo!();
+        // let version = u32::from_datagram(stream)?;
+        // let destination_connection_id_length = u8::from_datagram(stream)?;
+        // if destination_connection_id_length > 20 {
+        //     return Err(Error::InternalError(
+        //         "invalid destination connection id length",
+        //     ));
+        // }
+        // let destination_connection_id =
+        //     var_u160_from_stream(stream, destination_connection_id_length)?;
+        // let source_connection_id_length = u8::from_datagram(stream)?;
+        // if source_connection_id_length > 20 {
+        //     return Err(Error::InternalError("Invalid source connection id length"));
+        // }
+        // let source_connection_id = var_u160_from_stream(stream, source_connection_id_length)?;
+        // let remaining_results = stream.collect::<Vec<_>>();
+        // let errs = remaining_results
+        //     .iter()
+        //     .filter(|x| x.is_err())
+        //     .map(|x| x.clone().err().unwrap())
+        //     .collect::<Vec<_>>();
+        // if errs.len() > 0 {
+        //     return Err(errs[0].clone());
+        // }
+        // let mut retry_token = remaining_results.into_iter().flatten().collect::<Vec<_>>();
+        // // check if there's room for integrity tag
+        // if retry_token.len() < 16 {
+        //     return Err(Error::InternalError("Invalid retry token length"));
+        // }
+        // let mut retry_integrity_bytes = [0u8; 16];
+        // for i in 0..16 {
+        //     let tp = match retry_token.pop() {
+        //         Some(x) => Ok(x),
+        //         None => Err(Error::InternalError("missing retry integrity")),
+        //     }?;
+        //     retry_integrity_bytes[15 - i] = tp;
+        // }
+        // let (retry_integrity_tag, _) = u128::decode_from_bytes(&retry_integrity_bytes)?;
+        // Ok(Self {
+        //     version,
+        //     destination_connection_id_length,
+        //     destination_connection_id,
+        //     source_connection_id_length,
+        //     source_connection_id,
+        //     retry_token,
+        //     retry_integrity_tag,
+        // })
     }
 }
 
@@ -401,49 +485,66 @@ impl ShortPacketHeader {
         }
     }
     pub fn packet_type(&self) -> PacketType {
+        // FIXME stateless reset packets can also get to this path
         PacketType::OneRtt
     }
-    pub fn remove_protection<T>(
-        &mut self,
-        offset_stream: &mut T,
-        connection: &Connection,
-    ) -> error::Result<()>
-    where
-        T: Iterator<Item = error::Result<u8>>,
-    {
-        unimplemented!();
+    pub fn remove_protection(&mut self, mask: &[u8; 5]) {
+        if self.is_protected {
+            self.header_byte ^= mask[0] & 0x1f;
+            self.is_protected = false;
+        }
+    }
+    pub fn to_bytes(&self) -> Vec<u8> {
+        [
+            &[self.header_byte][..],
+            &self.destination_connection_id.to_var_bytes(8),
+        ]
+        .concat()
     }
 }
 
 #[derive(Debug)]
 pub struct PacketOneRtt {
-    packet_number: u32,
-    packet_payload: Vec<u8>,
+    header: ShortPacketHeader,
+    packet_number_bytes: Vec<u8>,
+    packet_number: u64,
+    packet_payload: Vec<Frame>,
 }
 
 impl PacketOneRtt {
-    pub fn from_headerless_stream<T>(
-        stream: &mut T,
-        header: ShortPacketHeader,
-    ) -> error::Result<Self>
+    pub fn from_stream<T>(stream: &mut T, connection: &Connection) -> error::Result<Self>
     where
-        T: Iterator<Item = error::Result<u8>>,
+        T: Iterator<Item = error::Result<u8>> + Clone,
     {
+        let header_byte = u8::from_datagram(stream)?;
+        let mut header = ShortPacketHeader::from_stream(stream, header_byte)?;
+        // get largest potential packet number
+        let mut packet_number_bytes_protected = var_bytes_from_stream(stream, 4)?;
+        let mut offset_stream = stream.clone();
+        let mask = connection.get_remote_hp_mask(&mut offset_stream)?;
+        header.remove_protection(&mask);
         let packet_number_length = header.packet_number_length()?;
-        let packet_number = var_u32_from_stream(stream, packet_number_length)?;
-        let packet_payload = all_bytes_from_stream(stream)?;
+        remove_pn_protection(&mut packet_number_bytes_protected, &mask)?;
+        let packet_number_bytes = packet_number_bytes_protected[..packet_number_length].to_vec();
+        let packet_number_lsb = var_u32_from_stream(
+            &mut utils::make_result_stream(&packet_number_bytes[..]),
+            packet_number_length,
+        )?;
+        let packet_number = connection.reconstruct_pn_initial(packet_number_lsb);
+        let protected_frame_data = utils::all_bytes_from_stream(stream)?;
+        let associated_data = [&header.to_bytes(), &packet_number_bytes[..]].concat();
+        let frame_data = connection.decrypt_remote_payload(
+            &protected_frame_data[..],
+            &associated_data[..],
+            packet_number,
+        )?;
+        let packet_payload = deserialize_frames(&mut utils::make_result_stream(&frame_data[..]))?;
         Ok(Self {
+            header,
+            packet_number_bytes,
             packet_number,
             packet_payload,
         })
-    }
-    pub fn from_stream<T>(stream: &mut T, header_byte: u8) -> error::Result<Self>
-    where
-        T: Iterator<Item = error::Result<u8>>,
-    {
-        let header = ShortPacketHeader::from_stream(stream, header_byte)?;
-        // TODO remove header protection here
-        Self::from_headerless_stream(stream, header)
     }
 }
 
@@ -468,8 +569,8 @@ impl PacketHeader {
     }
     pub fn get_packet_type(&self) -> PacketType {
         match self {
-            PacketHeader::Long(ref x) => x.packet_type(),
             PacketHeader::Short(ref x) => x.packet_type(),
+            PacketHeader::Long(ref x) => x.packet_type(),
         }
     }
 }
@@ -495,49 +596,6 @@ pub enum Packet {
     OneRtt(PacketOneRtt),
 }
 
-// pub fn next_packet<T>(data: &mut T) -> Result<Packet, Error>
-// where
-//     T: Iterator<Item = Result<u8, Error>>,
-// {
-//     // WARNING this function cannot be used for retrieving version
-//     // negotiation packets
-//     let header_byte = data.next().unwrap_or(Err(Error::InternalError))?;
-//     // check for conformance
-//     // (breaks for version negotiation)
-//     if header_byte & 0x40 != 0x40 {
-//         return Err(Error::InternalError);
-//     }
-//     if header_byte & 0x80 == 0x80 {
-//         // long header
-//         let long_packet_type: u8 = (header_byte & ((1 << 6) - 1)) >> 4;
-//         println!("{}", long_packet_type);
-//         println!("header_byte: {:#02x}", header_byte);
-//         match long_packet_type {
-//             0x00 => {
-//                 let res = PacketInitial::from_stream(data, header_byte)?;
-//                 Ok(Packet::Initial(res))
-//             }
-//             0x01 => {
-//                 let res = PacketZeroRtt::from_stream(data, header_byte)?;
-//                 Ok(Packet::ZeroRtt(res))
-//             }
-//             0x02 => {
-//                 let res = PacketHandshake::from_stream(data, header_byte)?;
-//                 Ok(Packet::Handshake(res))
-//             }
-//             0x03 => {
-//                 let res = PacketRetry::from_stream(data)?;
-//                 Ok(Packet::Retry(res))
-//             }
-//             _ => unreachable!(),
-//         }
-//     } else {
-//         // short header
-//         let res = PacketOneRtt::from_stream(data, header_byte)?;
-//         Ok(Packet::OneRtt(res))
-//     }
-// }
-
 pub fn next_header_from_stream<T>(stream: &mut T) -> error::Result<PacketHeader>
 where
     T: Iterator<Item = error::Result<u8>>,
@@ -554,52 +612,40 @@ where
     }
 }
 
-// pub fn stream_into_packets<T>(data: &mut T) -> Result<Vec<Packet>, Error>
-// where
-//     T: Iterator<Item = Result<u8, Error>>,
-// {
-//     let mut data = data.peekable();
-//     let mut rv = Vec::<Packet>::new();
-//     while !data.peek().is_none() {
-//         rv.push(next_packet(&mut data)?);
-//     }
-//     Ok(rv)
-// }
-
 pub fn decode_next_packet<T>(stream: &mut T, connection: &Connection) -> error::Result<Packet>
 where
     T: Iterator<Item = error::Result<u8>> + Clone,
 {
-    let header = next_header_from_stream(stream)?;
-    // skip packet number for sampling
-    let mut sample_stream = stream.clone().skip(4);
+    let mut header_stream = stream.clone();
+    let header = next_header_from_stream(&mut header_stream).unwrap();
     match header {
-        PacketHeader::Short(mut x) => {
-            let res = PacketOneRtt::from_headerless_stream(stream, x)?;
+        PacketHeader::Short(_) => {
+            let res = PacketOneRtt::from_stream(stream, connection)?;
             Ok(Packet::OneRtt(res))
         }
-        PacketHeader::Long(mut x) => {
-            match x.packet_type() {
-                PacketType::Handshake => {
-                    let res = PacketHandshake::from_headerless_stream(stream, x)?;
-                    Ok(Packet::Handshake(res))
-                }
-                PacketType::Initial => {
-                    let res = PacketInitial::from_headerless_stream(stream, x)?;
-                    Ok(Packet::Initial(res))
-                }
-                PacketType::ZeroRtt => {
-                    let res = PacketZeroRtt::from_headerless_stream(stream, x)?;
-                    Ok(Packet::ZeroRtt(res))
-                }
-                PacketType::Retry => {
-                    let res = PacketZeroRtt::from_headerless_stream(stream, x)?;
-                    Ok(Packet::ZeroRtt(res))
-                }
-                // FIXME possible to get here from VersionNegotiation
-                _ => unreachable!(),
+        PacketHeader::Long(x) => match x.packet_type() {
+            PacketType::Handshake => {
+                let res = PacketHandshake::from_stream(stream, connection)?;
+                Ok(Packet::Handshake(res))
             }
-        }
+            PacketType::Initial => {
+                let res = PacketInitial::from_stream(stream, connection)?;
+                Ok(Packet::Initial(res))
+            }
+            PacketType::ZeroRtt => {
+                let res = PacketZeroRtt::from_stream(stream, connection)?;
+                Ok(Packet::ZeroRtt(res))
+            }
+            PacketType::Retry => {
+                let res = PacketRetry::from_stream(stream)?;
+                Ok(Packet::Retry(res))
+            }
+            PacketType::VersionNegotiation => {
+                let res = PacketVersionNegotiation::from_stream(stream)?;
+                Ok(Packet::VersionNegotiation(res))
+            }
+            _ => unreachable!(),
+        },
     }
 }
 
@@ -617,7 +663,6 @@ where
 #[cfg(test)]
 mod test {
     use crate::connection::Connection;
-    use crate::tls;
     use crate::utils;
     use hex_literal::hex;
 
@@ -670,7 +715,7 @@ mod test {
         let header = super::next_header_from_stream(&mut header_stream).unwrap();
         let connection = Connection::new(
             true,
-            tls::Version::V1,
+            crate::version::Version::V1,
             header.get_destination_id(),
             header.get_destination_id_length() as usize,
         )
@@ -680,9 +725,7 @@ mod test {
 
     #[test]
     fn sample_initial_packet() {
-        let packet = test_packet_initial(&SAMPLE_PACKET_DATA);
-        println!("sample packet iniitial: {:#02x?}", packet);
-        assert!(false);
+        test_packet_initial(&SAMPLE_PACKET_DATA);
     }
 
     use ring::aead::quic as ring_quic;

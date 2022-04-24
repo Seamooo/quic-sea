@@ -5,7 +5,6 @@ use crate::utils::{
     all_bytes_from_stream, decode_bytes, decode_var_int, var_bytes_from_stream,
     var_int_from_stream, var_u160_from_stream,
 };
-use std::io::{self, Write};
 
 #[derive(Debug)]
 struct EcnCounts {
@@ -344,9 +343,8 @@ impl FrameStream {
         } else {
             (data.len() - inc) as u64
         };
-        // TODO uncomfortable with below typecast
         let length_usize = length as usize;
-        let (stream_data, tp) = decode_bytes(&data[inc..], length_usize)?;
+        let (stream_data, _) = decode_bytes(&data[inc..], length_usize)?;
         Ok((
             Self {
                 stream_id,
