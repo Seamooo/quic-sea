@@ -30,6 +30,7 @@ Connection ids issued by this implementation of QUIC are fixed to size u64
 - [x] packet deserialization
 - [x] packet routing
 - [x] `TLS_AES_128_GCM_SHA256` cipher suite support
+- [x] frame serialization
 - [ ] packet serialization
 - [x] packet number spaces
 - [x] packet number reconstruction
