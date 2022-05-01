@@ -527,7 +527,4 @@ mod test {
         let expected2 = hex!("47d0");
         assert_eq!(case2, expected2);
     }
-
-    // #[test]
-    fn test_encode_1200() {}
 }

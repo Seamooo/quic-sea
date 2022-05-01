@@ -261,13 +261,13 @@ impl PacketInitial {
         // get largest potential packet number
         let mut packet_number_bytes_protected = var_bytes_from_stream(stream, 4)?;
         let mut offset_stream = stream.clone();
-        let mask = connection.get_remote_hp_mask(&mut offset_stream)?;
+        let mask = connection.get_remote_hp_mask(Self::PN_SPACE, &mut offset_stream)?;
         header.remove_protection(&mask);
         let packet_number_length = header.packet_number_length()?;
         xor_pn_protection(&mut packet_number_bytes_protected, &mask)?;
         let packet_number_bytes = packet_number_bytes_protected[..packet_number_length].to_vec();
         let packet_number =
-            connection.reconstruct_remote_pn(&packet_number_bytes[..], Self::PN_SPACE)?;
+            connection.reconstruct_remote_pn(Self::PN_SPACE, &packet_number_bytes[..])?;
         let protected_frame_data =
             var_bytes_from_stream(stream, length as usize - packet_number_length)?;
         // create associated data
@@ -280,6 +280,7 @@ impl PacketInitial {
         ]
         .concat();
         let frame_data = connection.decrypt_remote_payload(
+            Self::PN_SPACE,
             &protected_frame_data[..],
             &associated_data[..],
             packet_number,
@@ -294,6 +295,7 @@ impl PacketInitial {
             packet_payload,
         })
     }
+
     /// Serializes packet to bytes with both packet protection and header protection
     /// applied.
     ///
@@ -302,8 +304,9 @@ impl PacketInitial {
     fn serialize(&self, connection: &Connection) -> error::Result<Vec<u8>> {
         let payload_bytes = serialize_frames(&self.packet_payload[..], false)?;
         let pn_length = self.header.packet_number_length()?;
-        let length =
-            (connection.get_local_protected_payload_len(payload_bytes.len()) + pn_length) as u64;
+        let length = (connection
+            .get_local_protected_payload_len(Self::PN_SPACE, payload_bytes.len())?
+            + pn_length) as u64;
         let length_bytes = utils::encode_var_int(length)?;
         let token_length_bytes = utils::encode_var_int(self.token.len() as u64)?;
         let associated_data = [
@@ -315,12 +318,13 @@ impl PacketInitial {
         ]
         .concat();
         let protected_payload = connection.encrypt_local_payload(
+            Self::PN_SPACE,
             &payload_bytes[..],
             &associated_data[..],
             self.packet_number,
         )?;
         let mut offset_stream = utils::make_result_stream(&protected_payload[(4 - pn_length)..]);
-        let mask = connection.get_local_hp_mask(&mut offset_stream)?;
+        let mask = connection.get_local_hp_mask(Self::PN_SPACE, &mut offset_stream)?;
         let mut protected_header = self.header.clone();
         protected_header.add_protection(&mask);
         let mut protected_packet_number_bytes = (&self.packet_number_bytes[..]).to_vec();
@@ -357,13 +361,13 @@ impl PacketZeroRtt {
         let (length, length_bytes) = utils::var_int_with_bytes_from_stream(stream)?;
         let mut packet_number_bytes_protected = var_bytes_from_stream(stream, 4)?;
         let mut offset_stream = stream.clone();
-        let mask = connection.get_remote_hp_mask(&mut offset_stream)?;
+        let mask = connection.get_remote_hp_mask(Self::PN_SPACE, &mut offset_stream)?;
         header.remove_protection(&mask);
         let packet_number_length = header.packet_number_length()?;
         xor_pn_protection(&mut packet_number_bytes_protected, &mask)?;
         let packet_number_bytes = packet_number_bytes_protected[..packet_number_length].to_vec();
         let packet_number =
-            connection.reconstruct_remote_pn(&packet_number_bytes[..], Self::PN_SPACE)?;
+            connection.reconstruct_remote_pn(Self::PN_SPACE, &packet_number_bytes[..])?;
         let protected_frame_data =
             var_bytes_from_stream(stream, length as usize - packet_number_length)?;
         // create associated data
@@ -374,6 +378,7 @@ impl PacketZeroRtt {
         ]
         .concat();
         let frame_data = connection.decrypt_remote_payload(
+            Self::PN_SPACE,
             &protected_frame_data[..],
             &associated_data[..],
             packet_number,
@@ -392,7 +397,6 @@ impl PacketZeroRtt {
 #[derive(Debug)]
 pub struct PacketHandshake {
     header: LongPacketHeader,
-    length: u64,
     packet_number_bytes: Vec<u8>,
     packet_number: u64,
     packet_payload: Vec<Frame>,
@@ -400,6 +404,34 @@ pub struct PacketHandshake {
 
 impl PacketHandshake {
     const PN_SPACE: PacketNumberSpace = PacketNumberSpace::Handshake;
+    const TYPE_BITS: u8 = 0x20;
+
+    pub fn new(packet_payload: Vec<Frame>, connection: &mut Connection) -> error::Result<Self> {
+        let (packet_number, packet_number_bytes) = connection.get_next_pn(Self::PN_SPACE)?;
+        let pn_length = packet_number_bytes.len() as u8;
+        if !(0 < pn_length && pn_length <= 4) {
+            return Err(Error::InternalError("invalid truncated_pn"));
+        }
+        let header_byte = Self::new_header_byte(pn_length - 1);
+        let header = LongPacketHeader::from_connection(connection, header_byte)?;
+        Self::validate_payload(&packet_payload)?;
+        Ok(Self {
+            header,
+            packet_number,
+            packet_number_bytes,
+            packet_payload,
+        })
+    }
+
+    fn new_header_byte(pn_length_bits: u8) -> u8 {
+        LongPacketHeader::HEADER_BITS | Self::TYPE_BITS | pn_length_bits
+    }
+
+    fn validate_payload(_packet_paylaod: &Vec<Frame>) -> error::Result<()> {
+        // TODO assert that only allowed frames are in the packet payload
+        Ok(())
+    }
+
     pub fn from_stream<T>(stream: &mut T, connection: &Connection) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>> + Clone,
@@ -410,13 +442,13 @@ impl PacketHandshake {
         let mut packet_number_bytes = var_bytes_from_stream(stream, 4)?;
         let mut offset_stream = stream.clone();
         // assumes packet is encoded by the remote
-        let mask = connection.get_remote_hp_mask(&mut offset_stream)?;
+        let mask = connection.get_remote_hp_mask(Self::PN_SPACE, &mut offset_stream)?;
         header.remove_protection(&mask);
         let packet_number_length = header.packet_number_length()?;
         xor_pn_protection(&mut packet_number_bytes, &mask)?;
         let packet_number_vec = packet_number_bytes[..packet_number_length].to_vec();
         let packet_number =
-            connection.reconstruct_remote_pn(&packet_number_bytes[..], Self::PN_SPACE)?;
+            connection.reconstruct_remote_pn(Self::PN_SPACE, &packet_number_bytes[..])?;
         let protected_frame_data =
             var_bytes_from_stream(stream, length as usize - packet_number_length)?;
         // create associated data
@@ -427,6 +459,7 @@ impl PacketHandshake {
         ]
         .concat();
         let frame_data = connection.decrypt_remote_payload(
+            Self::PN_SPACE,
             &protected_frame_data[..],
             &associated_data[..],
             packet_number,
@@ -434,11 +467,49 @@ impl PacketHandshake {
         let packet_payload = deserialize_frames(&mut utils::make_result_stream(&frame_data[..]))?;
         Ok(Self {
             header,
-            length,
             packet_number_bytes: packet_number_vec,
             packet_number,
             packet_payload,
         })
+    }
+
+    /// Serializes packet to bytes with both packet protection and header protection
+    /// applied.
+    ///
+    /// Note: connection used to construct this packet should be the same as sent to this
+    /// The only reason it is not stored is due to connection being behind a lock
+    fn serialize(&self, connection: &Connection) -> error::Result<Vec<u8>> {
+        let payload_bytes = serialize_frames(&self.packet_payload[..], false)?;
+        let pn_length = self.header.packet_number_length()?;
+        let length = (connection
+            .get_local_protected_payload_len(Self::PN_SPACE, payload_bytes.len())?
+            + pn_length) as u64;
+        let length_bytes = utils::encode_var_int(length)?;
+        let associated_data = [
+            &self.header.to_bytes()[..],
+            &length_bytes[..],
+            &self.packet_number_bytes[..],
+        ]
+        .concat();
+        let protected_payload = connection.encrypt_local_payload(
+            Self::PN_SPACE,
+            &payload_bytes[..],
+            &associated_data[..],
+            self.packet_number,
+        )?;
+        let mut offset_stream = utils::make_result_stream(&protected_payload[(4 - pn_length)..]);
+        let mask = connection.get_local_hp_mask(Self::PN_SPACE, &mut offset_stream)?;
+        let mut protected_header = self.header.clone();
+        protected_header.add_protection(&mask);
+        let mut protected_packet_number_bytes = (&self.packet_number_bytes[..]).to_vec();
+        xor_pn_protection(&mut protected_packet_number_bytes[..], &mask)?;
+        Ok([
+            &protected_header.to_bytes()[..],
+            &length_bytes[..],
+            &protected_packet_number_bytes[..],
+            &protected_payload[..],
+        ]
+        .concat())
     }
 }
 
@@ -608,16 +679,17 @@ impl PacketOneRtt {
         // get largest potential packet number
         let mut packet_number_bytes_protected = var_bytes_from_stream(stream, 4)?;
         let mut offset_stream = stream.clone();
-        let mask = connection.get_remote_hp_mask(&mut offset_stream)?;
+        let mask = connection.get_remote_hp_mask(Self::PN_SPACE, &mut offset_stream)?;
         header.remove_protection(&mask);
         let packet_number_length = header.packet_number_length()?;
         xor_pn_protection(&mut packet_number_bytes_protected, &mask)?;
         let packet_number_bytes = packet_number_bytes_protected[..packet_number_length].to_vec();
         let packet_number =
-            connection.reconstruct_remote_pn(&packet_number_bytes[..], Self::PN_SPACE)?;
+            connection.reconstruct_remote_pn(Self::PN_SPACE, &packet_number_bytes[..])?;
         let protected_frame_data = utils::all_bytes_from_stream(stream)?;
         let associated_data = [&header.to_bytes(), &packet_number_bytes[..]].concat();
         let frame_data = connection.decrypt_remote_payload(
+            Self::PN_SPACE,
             &protected_frame_data[..],
             &associated_data[..],
             packet_number,

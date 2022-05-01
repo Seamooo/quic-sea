@@ -15,6 +15,7 @@ struct PacketNumberSpaceInfo {
     largest_remote_ack: Option<u64>,
     largest_local_ack: Option<u64>,
     next_pn: u64,
+    tls_secrets: Option<tls::Secrets>,
 }
 
 impl PacketNumberSpaceInfo {
@@ -23,6 +24,7 @@ impl PacketNumberSpaceInfo {
             largest_remote_ack: None,
             largest_local_ack: None,
             next_pn: 0,
+            tls_secrets: None,
         }
     }
 }
@@ -39,7 +41,9 @@ fn truncate_pn(pn: u64, largest_ack: Option<u64>) -> error::Result<Vec<u8>> {
         }
         Some(x) => {
             if pn <= x {
-                return Err(Error::InternalError(""));
+                return Err(Error::InternalError(
+                    "Cannot truncate packet number smaller than largest acknowledged packet number",
+                ));
             }
             let diff = pn - x;
             let bit_len = diff.floor_log2()?;
@@ -51,7 +55,6 @@ fn truncate_pn(pn: u64, largest_ack: Option<u64>) -> error::Result<Vec<u8>> {
 
 #[derive(Debug)]
 pub struct Connection {
-    tls_secrets: tls::Secrets,
     version: version::Version,
     initial_pn_info: PacketNumberSpaceInfo,
     handshake_pn_info: PacketNumberSpaceInfo,
@@ -71,77 +74,117 @@ impl Connection {
         dcid: U160,
         dcid_len: usize,
     ) -> error::Result<Self> {
-        let tls_secrets =
+        let initial_tls_secrets =
             tls::Secrets::from_initial(is_server, &dcid.to_var_bytes(dcid_len)[..], &version)?;
+        let mut initial_pn_info = PacketNumberSpaceInfo::new();
+        initial_pn_info.tls_secrets = Some(initial_tls_secrets);
         Ok(Self {
-            tls_secrets,
             version,
-            initial_pn_info: PacketNumberSpaceInfo::new(),
+            initial_pn_info,
             handshake_pn_info: PacketNumberSpaceInfo::new(),
             application_pn_info: PacketNumberSpaceInfo::new(),
             dcid: (dcid, dcid_len),
             scid: None,
         })
     }
+
+    fn borrow_pn_info(&self, pn_space: PacketNumberSpace) -> &PacketNumberSpaceInfo {
+        match pn_space {
+            PacketNumberSpace::Initial => &self.initial_pn_info,
+            PacketNumberSpace::Handshake => &self.handshake_pn_info,
+            PacketNumberSpace::Application => &self.application_pn_info,
+        }
+    }
+
+    fn borrow_mut_pn_info(&mut self, pn_space: PacketNumberSpace) -> &mut PacketNumberSpaceInfo {
+        match pn_space {
+            PacketNumberSpace::Initial => &mut self.initial_pn_info,
+            PacketNumberSpace::Handshake => &mut self.handshake_pn_info,
+            PacketNumberSpace::Application => &mut self.application_pn_info,
+        }
+    }
+
+    fn borrow_tls_secrets(&self, pn_space: PacketNumberSpace) -> error::Result<&tls::Secrets> {
+        let pn_info = self.borrow_pn_info(pn_space);
+        pn_info.tls_secrets.as_ref().ok_or(Error::InternalError(
+            "attempted to retrieve unset tls secrets",
+        ))
+    }
+
     pub fn set_scid(&mut self, scid: U160, scid_len: usize) {
         self.scid = Some((scid, scid_len));
     }
+
     pub fn get_dcid(&self) -> (U160, u8) {
         let (a, b) = self.dcid;
         (a, b as u8)
     }
+
     pub fn get_scid(&self) -> error::Result<(U160, u8)> {
         let (a, b) = self.scid.ok_or(Error::InternalError("scid not set"))?;
         Ok((a, b as u8))
     }
-    pub fn get_local_hp_mask<T>(&self, sample_stream: &mut T) -> error::Result<[u8; 5]>
+
+    pub fn get_local_hp_mask<T>(
+        &self,
+        pn_space: PacketNumberSpace,
+        sample_stream: &mut T,
+    ) -> error::Result<[u8; 5]>
     where
         T: Iterator<Item = error::Result<u8>>,
     {
+        let tls_secrets = self.borrow_tls_secrets(pn_space)?;
         let sample = utils::var_bytes_from_stream(
             sample_stream,
-            self.tls_secrets.local.cipher_suite.sample_len(),
+            tls_secrets.local.cipher_suite.sample_len(),
         )?;
-        self.tls_secrets
-            .local
-            .get_header_protection_mask(&sample[..])
+        tls_secrets.local.get_header_protection_mask(&sample[..])
     }
-    pub fn get_remote_hp_mask<T>(&self, sample_stream: &mut T) -> error::Result<[u8; 5]>
+
+    pub fn get_remote_hp_mask<T>(
+        &self,
+        pn_space: PacketNumberSpace,
+        sample_stream: &mut T,
+    ) -> error::Result<[u8; 5]>
     where
         T: Iterator<Item = error::Result<u8>>,
     {
+        let tls_secrets = self.borrow_tls_secrets(pn_space)?;
         let sample = utils::var_bytes_from_stream(
             sample_stream,
-            self.tls_secrets.remote.cipher_suite.sample_len(),
+            tls_secrets.remote.cipher_suite.sample_len(),
         )?;
-        self.tls_secrets
-            .remote
-            .get_header_protection_mask(&sample[..])
+        tls_secrets.remote.get_header_protection_mask(&sample[..])
     }
+
     pub fn decrypt_remote_payload(
         &self,
+        pn_space: PacketNumberSpace,
         payload: &[u8],
         associated_data: &[u8],
         packet_number: u64,
     ) -> error::Result<Vec<u8>> {
-        self.tls_secrets
+        let tls_secrets = self.borrow_tls_secrets(pn_space)?;
+        tls_secrets
             .remote
             .decrypt_payload(payload, associated_data, packet_number)
     }
     pub fn encrypt_local_payload(
         &self,
+        pn_space: PacketNumberSpace,
         payload: &[u8],
         associated_data: &[u8],
         packet_number: u64,
     ) -> error::Result<Vec<u8>> {
-        self.tls_secrets
+        let tls_secrets = self.borrow_tls_secrets(pn_space)?;
+        tls_secrets
             .local
             .encrypt_payload(payload, associated_data, packet_number)
     }
     pub fn reconstruct_remote_pn(
         &self,
-        pn_lsb: &[u8],
         pn_space: PacketNumberSpace,
+        pn_lsb: &[u8],
     ) -> error::Result<u64> {
         let pn_length = pn_lsb.len();
         assert!(pn_length <= 4);
@@ -168,8 +211,14 @@ impl Connection {
         };
         Ok(rv)
     }
-    pub fn get_local_protected_payload_len(&self, payload_len: usize) -> usize {
-        self.tls_secrets.local.cipher_suite.tag_len() + payload_len
+
+    pub fn get_local_protected_payload_len(
+        &self,
+        pn_space: PacketNumberSpace,
+        payload_len: usize,
+    ) -> error::Result<usize> {
+        let tls_secrets = self.borrow_tls_secrets(pn_space)?;
+        Ok(tls_secrets.local.cipher_suite.tag_len() + payload_len)
     }
 
     /// Returns next packet number and the truncated encoding
