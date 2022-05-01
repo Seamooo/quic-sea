@@ -14,3 +14,4 @@ log = "0.4"
 
 [dev-dependencies]
 ring = "0.16"
+pretty_assertions = "1.2"

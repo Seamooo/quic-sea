@@ -60,6 +60,10 @@ pub mod prelude {
         where
             T: Iterator<Item = error::Result<u8>>;
     }
+    pub trait FloorLog2 {
+        // TODO implement asm accel for this
+        fn floor_log2(&self) -> error::Result<usize>;
+    }
 
     impl DecodeFromBytes for u8 {
         type Output = Self;
@@ -247,6 +251,67 @@ pub mod prelude {
                 );
             }
             Ok(Self { idx0, idx1 })
+        }
+    }
+
+    impl FloorLog2 for u8 {
+        fn floor_log2(&self) -> error::Result<usize> {
+            if *self == 0 {
+                Err(Error::InternalError("no bits set"))
+            } else {
+                let mut rv = 0usize;
+                let mut tp = self.clone();
+                while tp > 0 {
+                    rv += 1;
+                    tp >>= 1;
+                }
+                Ok(rv)
+            }
+        }
+    }
+    impl FloorLog2 for u16 {
+        fn floor_log2(&self) -> error::Result<usize> {
+            if *self == 0 {
+                Err(Error::InternalError("no bits set"))
+            } else {
+                let mut rv = 0usize;
+                let mut tp = self.clone();
+                while tp > 0 {
+                    rv += 1;
+                    tp >>= 1;
+                }
+                Ok(rv)
+            }
+        }
+    }
+    impl FloorLog2 for u32 {
+        fn floor_log2(&self) -> error::Result<usize> {
+            if *self == 0 {
+                Err(Error::InternalError("no bits set"))
+            } else {
+                let mut rv = 0usize;
+                let mut tp = self.clone();
+                while tp > 0 {
+                    rv += 1;
+                    tp >>= 1;
+                }
+                Ok(rv)
+            }
+        }
+    }
+    impl FloorLog2 for u64 {
+        fn floor_log2(&self) -> error::Result<usize> {
+            if *self == 0 {
+                Err(Error::InternalError("no bits set"))
+            } else {
+                let mut rv = 0usize;
+                let mut tp = self.clone();
+                while tp > 0 {
+                    rv += 1;
+                    tp >>= 1;
+                }
+                Ok(rv)
+            }
         }
     }
 }
@@ -444,7 +509,25 @@ pub fn encode_var_int(x: u64) -> error::Result<Vec<u8>> {
         return Err(Error::InternalError("var int overflow"));
     };
     let len = 1u64 << n_shifts;
-    let len_val: u64 = (n_shifts << 6) << (len - 1);
+    let len_val: u64 = (n_shifts << 6) << ((len - 1) * 8);
     let bytes = (len_val | x).to_be_bytes();
     Ok(bytes[(8 - len as usize)..].to_vec())
+}
+
+#[cfg(test)]
+mod test {
+    use hex_literal::hex;
+
+    #[test]
+    fn encode_var_int() {
+        let case1 = super::encode_var_int(0).unwrap();
+        let expected1 = hex!("00");
+        assert_eq!(case1, expected1);
+        let case2 = super::encode_var_int(2000).unwrap();
+        let expected2 = hex!("47d0");
+        assert_eq!(case2, expected2);
+    }
+
+    // #[test]
+    fn test_encode_1200() {}
 }

@@ -330,6 +330,7 @@ impl FrameStream {
             | if has_offset { 0x04u8 } else { 0x00u8 }
             | if include_len { 0x02u8 } else { 0x00u8 }
             | if self.is_fin { 0x01u8 } else { 0x00u8 };
+        let stream_id_bytes = utils::encode_var_int(self.stream_id)?;
         let offset_bytes = if has_offset {
             utils::encode_var_int(self.offset)?
         } else {
@@ -342,6 +343,7 @@ impl FrameStream {
         };
         Ok([
             &[type_byte][..],
+            &stream_id_bytes[..],
             &offset_bytes[..],
             &len_bytes[..],
             &self.stream_data[..],
@@ -596,7 +598,7 @@ impl FrameNewConnectionId {
             &utils::encode_var_int(self.sequence_number)?[..],
             &utils::encode_var_int(self.retire_prior_to)?[..],
             &[self.length][..],
-            &self.connection_id.to_bytes()[..],
+            &self.connection_id.to_var_bytes(self.length as usize)[..],
             &self.stateless_reset_token.to_be_bytes()[..],
         ]
         .concat())
@@ -680,19 +682,19 @@ pub struct FrameConnectionClose {
 }
 
 impl FrameConnectionClose {
-    pub fn new_application_error(error_code: u64, frame_type: u64, reason_phrase: Vec<u8>) -> Self {
+    pub fn new_application_error(error_code: u64, reason_phrase: Vec<u8>) -> Self {
         Self {
             error_code,
-            frame_type: Some(frame_type),
+            frame_type: None,
             reason_phrase_length: reason_phrase.len() as u64,
             reason_phrase,
             is_application_error: true,
         }
     }
-    pub fn new_error(error_code: u64, reason_phrase: Vec<u8>) -> Self {
+    pub fn new_error(error_code: u64, frame_type: u64, reason_phrase: Vec<u8>) -> Self {
         Self {
             error_code,
-            frame_type: None,
+            frame_type: Some(frame_type),
             reason_phrase_length: reason_phrase.len() as u64,
             reason_phrase,
             is_application_error: false,
@@ -732,6 +734,7 @@ impl FrameConnectionClose {
         };
         Ok([
             &[type_byte][..],
+            &utils::encode_var_int(self.error_code)?[..],
             &frame_type_bytes[..],
             &utils::encode_var_int(self.reason_phrase_length)?[..],
             &self.reason_phrase[..],
@@ -872,4 +875,227 @@ pub fn serialize_frames(frames: &[Frame], is_df_end: bool) -> error::Result<Vec<
         bytes_vec.push(bytes?);
     }
     Ok(bytes_vec.into_iter().flatten().collect::<Vec<_>>())
+}
+
+#[cfg(test)]
+mod test {
+    use crate::utils::U160;
+    use hex_literal::hex;
+
+    #[test]
+    fn serialize_frames() {
+        // Padding
+        let case1 = vec![super::Frame::Padding];
+        let expected1 = hex!("00");
+        let result1 = super::serialize_frames(&case1[..], false).unwrap();
+        assert_eq!(&result1[..], &expected1[..]);
+
+        // Ping
+        let case2 = vec![super::Frame::Ping];
+        let expected2 = hex!("01");
+        let result2 = super::serialize_frames(&case2[..], false).unwrap();
+        assert_eq!(&result2[..], &expected2[..]);
+
+        // ACK wout EcnCounts
+        let case3 = vec![super::Frame::Ack(super::FrameAck {
+            largest_acknowledged: 2000,
+            ack_delay: 0,
+            ack_range_count: 1,
+            first_ack_range: 0,
+            ack_range: vec![super::AckRange {
+                gap: 2,
+                ack_range_length: 2,
+            }],
+            ecn_counts: None,
+        })];
+        let expected3 = hex!("02 47d0 00 01 00 0202");
+        let result3 = super::serialize_frames(&case3[..], false).unwrap();
+        assert_eq!(&result3[..], &expected3[..]);
+
+        // ACK with EcnCounts
+        let case4 = vec![super::Frame::Ack(super::FrameAck {
+            largest_acknowledged: 2000,
+            ack_delay: 0,
+            ack_range_count: 1,
+            first_ack_range: 0,
+            ack_range: vec![super::AckRange {
+                gap: 2,
+                ack_range_length: 2,
+            }],
+            ecn_counts: Some(super::EcnCounts {
+                ect0_count: 0,
+                ect1_count: 0,
+                ecn_ce_count: 0,
+            }),
+        })];
+        let expected4 = hex!("03 47d0 00 01 00 0202 000000");
+        let result4 = super::serialize_frames(&case4[..], false).unwrap();
+        assert_eq!(&result4[..], &expected4[..]);
+
+        // ResetStream
+        let case5 = vec![super::Frame::ResetStream(super::FrameResetStream::new(
+            0, 0, 0,
+        ))];
+        let expected5 = hex!("04 000000");
+        let result5 = super::serialize_frames(&case5[..], false).unwrap();
+        assert_eq!(&result5[..], &expected5[..]);
+
+        // StopSending
+        let case6 = vec![super::Frame::StopSending(super::FrameStopSending::new(
+            0, 0,
+        ))];
+        let expected6 = hex!("05 0000");
+        let result6 = super::serialize_frames(&case6[..], false).unwrap();
+        assert_eq!(&result6[..], &expected6[..]);
+
+        // Crypto
+        let case7 = vec![super::Frame::Crypto(super::FrameCrypto::new(
+            hex!("41414141 41414141").to_vec(),
+        ))];
+        let expected7 = hex!("06 00 08 41414141 41414141");
+        let result7 = super::serialize_frames(&case7[..], false).unwrap();
+        assert_eq!(&result7[..], &expected7[..]);
+
+        // NewToken
+        let case8 = vec![super::Frame::NewToken(super::FrameNewToken::new(
+            hex!("41414141 41414141").to_vec(),
+        ))];
+        let expected8 = hex!("07 08 41414141 41414141");
+        let result8 = super::serialize_frames(&case8[..], false).unwrap();
+        assert_eq!(&result8[..], &expected8[..]);
+
+        // Stream isn't fin
+        let case9 = vec![super::Frame::Stream(super::FrameStream::new(
+            1,
+            hex!("41414141 41414141").to_vec(),
+            false,
+        ))];
+        let expected9 = hex!("0a 01 08 41414141 41414141");
+        let result9 = super::serialize_frames(&case9[..], false).unwrap();
+        assert_eq!(&result9[..], &expected9[..]);
+
+        // Stream is fin
+        let case10 = vec![super::Frame::Stream(super::FrameStream::new(
+            1,
+            hex!("41414141 41414141").to_vec(),
+            true,
+        ))];
+        let expected10 = hex!("0b 01 08 41414141 41414141");
+        let result10 = super::serialize_frames(&case10[..], false).unwrap();
+        assert_eq!(&result10[..], &expected10[..]);
+
+        // MaxData
+        let case11 = vec![super::Frame::MaxData(super::FrameMaxData::new(2000))];
+        let expected11 = hex!("10 47d0");
+        let result11 = super::serialize_frames(&case11[..], false).unwrap();
+        assert_eq!(&result11[..], &expected11[..]);
+
+        // MaxStreamData
+        let case12 = vec![super::Frame::MaxStreamData(super::FrameMaxStreamData::new(
+            4, 2000,
+        ))];
+        let expected12 = hex!("11 04 47d0");
+        let result12 = super::serialize_frames(&case12[..], false).unwrap();
+        assert_eq!(&result12[..], &expected12[..]);
+
+        // MaxStreams isn't unidirectional
+        let case13 = vec![super::Frame::MaxStreams(super::FrameMaxStreams::new(
+            4, false,
+        ))];
+        let expected13 = hex!("12 04");
+        let result13 = super::serialize_frames(&case13[..], false).unwrap();
+        assert_eq!(&result13[..], &expected13[..]);
+
+        // MaxStreams is unidirectional
+        let case14 = vec![super::Frame::MaxStreams(super::FrameMaxStreams::new(
+            4, true,
+        ))];
+        let expected14 = hex!("13 04");
+        let result14 = super::serialize_frames(&case14[..], false).unwrap();
+        assert_eq!(&result14[..], &expected14[..]);
+
+        // DataBlocked
+        let case15 = vec![super::Frame::DataBlocked(super::FrameDataBlocked::new(4))];
+        let expected15 = hex!("14 04");
+        let result15 = super::serialize_frames(&case15[..], false).unwrap();
+        assert_eq!(&result15[..], &expected15[..]);
+
+        // StreamDataBlocked
+        let case16 = vec![super::Frame::StreamDataBlocked(
+            super::FrameStreamDataBlocked::new(4, 2000),
+        )];
+        let expected16 = hex!("15 04 47d0");
+        let result16 = super::serialize_frames(&case16[..], false).unwrap();
+        assert_eq!(&result16[..], &expected16[..]);
+
+        // StreamsBlocked not unidirectional limit
+        let case17 = vec![super::Frame::StreamsBlocked(
+            super::FrameStreamsBlocked::new(4, false),
+        )];
+        let expected17 = hex!("16 04");
+        let result17 = super::serialize_frames(&case17[..], false).unwrap();
+        assert_eq!(&result17[..], &expected17[..]);
+
+        // StreamsBlocked unidirectional limit
+        let case18 = vec![super::Frame::StreamsBlocked(
+            super::FrameStreamsBlocked::new(4, true),
+        )];
+        let expected18 = hex!("17 04");
+        let result18 = super::serialize_frames(&case18[..], false).unwrap();
+        assert_eq!(&result18[..], &expected18[..]);
+
+        // NewConnectionId
+        let case19 = vec![super::Frame::NewConnectionId(
+            super::FrameNewConnectionId::new(4, 4, U160::zero(), 0),
+        )];
+        let expected19 = hex!("18 04 04 08 00000000 00000000 00000000 00000000 00000000 00000000");
+        let result19 = super::serialize_frames(&case19[..], false).unwrap();
+        assert_eq!(&result19[..], &expected19[..]);
+
+        // RetireConnectionId
+        let case20 = vec![super::Frame::RetireConnectionId(
+            super::FrameRetireConnectionId::new(2),
+        )];
+        let expected20 = hex!("19 02");
+        let result20 = super::serialize_frames(&case20[..], false).unwrap();
+        assert_eq!(&result20[..], &expected20[..]);
+
+        // PathChallenge
+        let case21 = vec![super::Frame::PathChallenge(super::FramePathChallenge::new(
+            3328591,
+        ))];
+        let expected21 = hex!("1a 00000000 0032ca4f");
+        let result21 = super::serialize_frames(&case21[..], false).unwrap();
+        assert_eq!(&result21[..], &expected21[..]);
+
+        // PathResponse
+        let case22 = vec![super::Frame::PathResponse(super::FramePathResponse::new(
+            3328591,
+        ))];
+        let expected22 = hex!("1b 00000000 0032ca4f");
+        let result22 = super::serialize_frames(&case22[..], false).unwrap();
+        assert_eq!(&result22[..], &expected22[..]);
+
+        // ConnectionClose protocol layer error
+        let case23 = vec![super::Frame::ConnectionClose(
+            super::FrameConnectionClose::new_error(4, 0, b"bad thing happened".to_vec()),
+        )];
+        let expected23 = hex!("1c 04 00 12 626164207468696e672068617070656e6564");
+        let result23 = super::serialize_frames(&case23[..], false).unwrap();
+        assert_eq!(&result23[..], &expected23[..]);
+
+        // ConnectionClose application layer error
+        let case23 = vec![super::Frame::ConnectionClose(
+            super::FrameConnectionClose::new_application_error(4, b"bad thing happened".to_vec()),
+        )];
+        let expected23 = hex!("1d 04 12 626164207468696e672068617070656e6564");
+        let result23 = super::serialize_frames(&case23[..], false).unwrap();
+        assert_eq!(&result23[..], &expected23[..]);
+
+        // Padding
+        let case24 = vec![super::Frame::HandshakeDone];
+        let expected24 = hex!("1e");
+        let result24 = super::serialize_frames(&case24[..], false).unwrap();
+        assert_eq!(&result24[..], &expected24[..]);
+    }
 }

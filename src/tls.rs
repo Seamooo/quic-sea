@@ -1,5 +1,4 @@
 use crate::error::{self, Error};
-use crate::utils::U160;
 use crate::version;
 use hkdf::Hkdf;
 use openssl::rand::rand_bytes;
@@ -23,9 +22,15 @@ pub enum ProtectionProtocol {
 impl ProtectionProtocol {
     pub fn sample_len(&self) -> usize {
         match self {
-            ProtectionProtocol::Aes256GcmSha256 => 32,
-            ProtectionProtocol::Aes128GcmSha256 => 16,
-            ProtectionProtocol::Aes128CcmSha256 => 16,
+            Self::Aes256GcmSha256 => 32,
+            Self::Aes128GcmSha256 => 16,
+            Self::Aes128CcmSha256 => 16,
+            _ => unimplemented!(),
+        }
+    }
+    pub fn tag_len(&self) -> usize {
+        match self {
+            Self::Aes128GcmSha256 => 16,
             _ => unimplemented!(),
         }
     }
@@ -77,7 +82,7 @@ impl Secrets {
     pub fn from_initial(
         is_server: bool,
         cid_bytes: &[u8],
-        version: version::Version,
+        version: &version::Version,
     ) -> error::Result<Self> {
         let (initial_secret, _) =
             Hkdf::<Sha256>::extract(Some(version.get_kdf_initial_salt()), cid_bytes);
@@ -206,10 +211,10 @@ impl Secret {
     }
 }
 
-pub fn get_connection_id() -> U160 {
+pub fn get_connection_id() -> u64 {
     let mut buff = [0u8; 8];
     rand_bytes(&mut buff).unwrap();
-    U160::from(u64::from_be_bytes(buff))
+    u64::from_be_bytes(buff)
 }
 
 pub fn get_header_protection_mask(

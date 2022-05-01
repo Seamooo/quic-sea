@@ -1,17 +1,17 @@
 use crate::connection::{Connection, PacketNumberSpace};
 use crate::error::{self, Error};
-use crate::frame::{deserialize_frames, Frame};
+use crate::frame::{deserialize_frames, serialize_frames, Frame};
 use crate::utils::{self, prelude::*, var_bytes_from_stream, var_u160_from_stream};
 
 const VERSION_NEGOTIATION_VERSION_VALUE: u32 = 0;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VersionNegotiationHeaderUnionFields {
     pub destination_connection_id: Vec<u8>,
     pub source_connection_id: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LongPacketHeader {
     header_byte: u8,
     pub version: u32,
@@ -23,7 +23,7 @@ pub struct LongPacketHeader {
     is_protected: bool,
 }
 
-fn remove_pn_protection(pn_bytes: &mut [u8], mask: &[u8; 5]) -> error::Result<()> {
+fn xor_pn_protection(pn_bytes: &mut [u8], mask: &[u8; 5]) -> error::Result<()> {
     if pn_bytes.len() > 4 {
         Err(Error::InternalError("too many bytes for packet number"))
     } else {
@@ -35,6 +35,21 @@ fn remove_pn_protection(pn_bytes: &mut [u8], mask: &[u8; 5]) -> error::Result<()
 }
 
 impl LongPacketHeader {
+    const HEADER_BITS: u8 = 0xc0;
+    pub fn from_connection(connection: &Connection, header_byte: u8) -> error::Result<Self> {
+        let (destination_connection_id, destination_connection_id_length) = connection.get_dcid();
+        let (source_connection_id, source_connection_id_length) = connection.get_scid()?;
+        Ok(Self {
+            header_byte,
+            version: connection.get_version_field(),
+            destination_connection_id,
+            destination_connection_id_length,
+            source_connection_id,
+            source_connection_id_length,
+            version_negotiation: None,
+            is_protected: false,
+        })
+    }
     pub fn from_stream<T>(stream: &mut T, header_byte: u8) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>>,
@@ -126,6 +141,13 @@ impl LongPacketHeader {
         }
     }
 
+    pub fn add_protection(&mut self, mask: &[u8; 5]) {
+        if !self.is_protected {
+            self.header_byte ^= mask[0] & 0x0f;
+            self.is_protected = true;
+        }
+    }
+
     pub fn packet_number_length(&self) -> error::Result<usize> {
         if self.is_protected {
             Err(Error::InternalError(
@@ -189,17 +211,45 @@ impl PacketVersionNegotiation {
 #[derive(Debug)]
 pub struct PacketInitial {
     header: LongPacketHeader,
-    token_length: u64,
     token: Vec<u8>,
-    length: u64,
-    packet_number_bytes: Vec<u8>,
     packet_number: u64,
+    packet_number_bytes: Vec<u8>,
     packet_payload: Vec<Frame>,
 }
 
 impl PacketInitial {
     const PN_SPACE: PacketNumberSpace = PacketNumberSpace::Initial;
-    pub fn from_stream<T>(stream: &mut T, connection: &Connection) -> error::Result<Self>
+    const TYPE_BITS: u8 = 0x00;
+    pub fn new(
+        packet_payload: Vec<Frame>,
+        token: Option<Vec<u8>>,
+        connection: &mut Connection,
+    ) -> error::Result<Self> {
+        let (packet_number, packet_number_bytes) = connection.get_next_pn(Self::PN_SPACE)?;
+        let pn_length = packet_number_bytes.len() as u8;
+        if !(0 < pn_length && pn_length <= 4) {
+            return Err(Error::InternalError("invalid truncated_pn"));
+        }
+        let header_byte = Self::new_header_byte(pn_length - 1);
+        let header = LongPacketHeader::from_connection(connection, header_byte)?;
+        let token = if let Some(x) = token { x } else { vec![] };
+        Self::validate_payload(&packet_payload)?;
+        Ok(Self {
+            header,
+            token,
+            packet_number,
+            packet_number_bytes,
+            packet_payload,
+        })
+    }
+    fn new_header_byte(pn_length_bits: u8) -> u8 {
+        LongPacketHeader::HEADER_BITS | Self::TYPE_BITS | pn_length_bits
+    }
+    fn validate_payload(_packet_paylaod: &Vec<Frame>) -> error::Result<()> {
+        // TODO assert that only allowed frames are in the packet payload
+        Ok(())
+    }
+    fn from_stream<T>(stream: &mut T, connection: &Connection) -> error::Result<Self>
     where
         T: Iterator<Item = error::Result<u8>> + Clone,
     {
@@ -214,9 +264,10 @@ impl PacketInitial {
         let mask = connection.get_remote_hp_mask(&mut offset_stream)?;
         header.remove_protection(&mask);
         let packet_number_length = header.packet_number_length()?;
-        remove_pn_protection(&mut packet_number_bytes_protected, &mask)?;
+        xor_pn_protection(&mut packet_number_bytes_protected, &mask)?;
         let packet_number_bytes = packet_number_bytes_protected[..packet_number_length].to_vec();
-        let packet_number = connection.reconstruct_pn(&packet_number_bytes[..], Self::PN_SPACE)?;
+        let packet_number =
+            connection.reconstruct_remote_pn(&packet_number_bytes[..], Self::PN_SPACE)?;
         let protected_frame_data =
             var_bytes_from_stream(stream, length as usize - packet_number_length)?;
         // create associated data
@@ -234,15 +285,55 @@ impl PacketInitial {
             packet_number,
         )?;
         let packet_payload = deserialize_frames(&mut utils::make_result_stream(&frame_data[..]))?;
+        Self::validate_payload(&packet_payload)?;
         Ok(Self {
             header,
-            token_length,
             token,
-            length,
-            packet_number_bytes,
             packet_number,
+            packet_number_bytes,
             packet_payload,
         })
+    }
+    /// Serializes packet to bytes with both packet protection and header protection
+    /// applied.
+    ///
+    /// Note: connection used to construct this packet should be the same as sent to this
+    /// The only reason it is not stored is due to connection being behind a lock
+    fn serialize(&self, connection: &Connection) -> error::Result<Vec<u8>> {
+        let payload_bytes = serialize_frames(&self.packet_payload[..], false)?;
+        let pn_length = self.header.packet_number_length()?;
+        let length =
+            (connection.get_local_protected_payload_len(payload_bytes.len()) + pn_length) as u64;
+        let length_bytes = utils::encode_var_int(length)?;
+        let token_length_bytes = utils::encode_var_int(self.token.len() as u64)?;
+        let associated_data = [
+            &self.header.to_bytes()[..],
+            &token_length_bytes[..],
+            &self.token[..],
+            &length_bytes[..],
+            &self.packet_number_bytes[..],
+        ]
+        .concat();
+        let protected_payload = connection.encrypt_local_payload(
+            &payload_bytes[..],
+            &associated_data[..],
+            self.packet_number,
+        )?;
+        let mut offset_stream = utils::make_result_stream(&protected_payload[(4 - pn_length)..]);
+        let mask = connection.get_local_hp_mask(&mut offset_stream)?;
+        let mut protected_header = self.header.clone();
+        protected_header.add_protection(&mask);
+        let mut protected_packet_number_bytes = (&self.packet_number_bytes[..]).to_vec();
+        xor_pn_protection(&mut protected_packet_number_bytes[..], &mask)?;
+        Ok([
+            &protected_header.to_bytes()[..],
+            &token_length_bytes[..],
+            &self.token[..],
+            &length_bytes[..],
+            &protected_packet_number_bytes[..],
+            &protected_payload[..],
+        ]
+        .concat())
     }
 }
 
@@ -269,9 +360,10 @@ impl PacketZeroRtt {
         let mask = connection.get_remote_hp_mask(&mut offset_stream)?;
         header.remove_protection(&mask);
         let packet_number_length = header.packet_number_length()?;
-        remove_pn_protection(&mut packet_number_bytes_protected, &mask)?;
+        xor_pn_protection(&mut packet_number_bytes_protected, &mask)?;
         let packet_number_bytes = packet_number_bytes_protected[..packet_number_length].to_vec();
-        let packet_number = connection.reconstruct_pn(&packet_number_bytes[..], Self::PN_SPACE)?;
+        let packet_number =
+            connection.reconstruct_remote_pn(&packet_number_bytes[..], Self::PN_SPACE)?;
         let protected_frame_data =
             var_bytes_from_stream(stream, length as usize - packet_number_length)?;
         // create associated data
@@ -321,9 +413,10 @@ impl PacketHandshake {
         let mask = connection.get_remote_hp_mask(&mut offset_stream)?;
         header.remove_protection(&mask);
         let packet_number_length = header.packet_number_length()?;
-        remove_pn_protection(&mut packet_number_bytes, &mask)?;
+        xor_pn_protection(&mut packet_number_bytes, &mask)?;
         let packet_number_vec = packet_number_bytes[..packet_number_length].to_vec();
-        let packet_number = connection.reconstruct_pn(&packet_number_bytes[..], Self::PN_SPACE)?;
+        let packet_number =
+            connection.reconstruct_remote_pn(&packet_number_bytes[..], Self::PN_SPACE)?;
         let protected_frame_data =
             var_bytes_from_stream(stream, length as usize - packet_number_length)?;
         // create associated data
@@ -481,6 +574,12 @@ impl ShortPacketHeader {
             self.is_protected = false;
         }
     }
+    pub fn add_protection(&mut self, mask: &[u8; 5]) {
+        if !self.is_protected {
+            self.header_byte ^= mask[0] & 0x1f;
+            self.is_protected = true;
+        }
+    }
     pub fn to_bytes(&self) -> Vec<u8> {
         [
             &[self.header_byte][..],
@@ -512,9 +611,10 @@ impl PacketOneRtt {
         let mask = connection.get_remote_hp_mask(&mut offset_stream)?;
         header.remove_protection(&mask);
         let packet_number_length = header.packet_number_length()?;
-        remove_pn_protection(&mut packet_number_bytes_protected, &mask)?;
+        xor_pn_protection(&mut packet_number_bytes_protected, &mask)?;
         let packet_number_bytes = packet_number_bytes_protected[..packet_number_length].to_vec();
-        let packet_number = connection.reconstruct_pn(&packet_number_bytes[..], Self::PN_SPACE)?;
+        let packet_number =
+            connection.reconstruct_remote_pn(&packet_number_bytes[..], Self::PN_SPACE)?;
         let protected_frame_data = utils::all_bytes_from_stream(stream)?;
         let associated_data = [&header.to_bytes(), &packet_number_bytes[..]].concat();
         let frame_data = connection.decrypt_remote_payload(
@@ -647,8 +747,10 @@ where
 #[cfg(test)]
 mod test {
     use crate::connection::Connection;
-    use crate::utils;
+    use crate::frame;
+    use crate::utils::{self, U160};
     use hex_literal::hex;
+    use pretty_assertions::assert_eq;
 
     const SAMPLE_PACKET_DATA: [u8; 1200] = hex!(
         "
@@ -693,6 +795,19 @@ mod test {
         "
     );
 
+    const SAMPLE_CRYPTO_FRAME: [u8; 245] = hex!(
+        "
+        060040f1010000ed0303ebf8fa56f129 39b9584a3896472ec40bb863cfd3e868
+        04fe3a47f06a2b69484c000004130113 02010000c000000010000e00000b6578
+        616d706c652e636f6dff01000100000a 00080006001d00170018001000070005
+        04616c706e0005000501000000000033 00260024001d00209370b2c9caa47fba
+        baf4559fedba753de171fa71f50f1ce1 5d43e994ec74d748002b000302030400
+        0d0010000e0403050306030203080408 050806002d00020101001c0002400100
+        3900320408ffffffffffffffff050480 00ffff07048000ffff08011001048000
+        75300901100f088394c8f03e51570806 048000ffff
+        "
+    );
+
     fn test_packet_initial(packet_data: &[u8]) -> super::PacketInitial {
         let mut stream = utils::make_result_stream(packet_data);
         let mut header_stream = stream.clone();
@@ -712,6 +827,67 @@ mod test {
         test_packet_initial(&SAMPLE_PACKET_DATA);
     }
 
+    #[test]
+    fn make_header_byte() {
+        let header_byte = super::PacketInitial::new_header_byte(0x3u8);
+        let expected_header_byte = 0xc3u8;
+        assert_eq!(
+            header_byte, expected_header_byte,
+            "\nheader_byte: {:X?},\nexpected_header_byte: {:X?}",
+            header_byte, expected_header_byte
+        );
+    }
+
+    #[test]
+    fn serialize_sample_initial_packet() {
+        let crypto_frame =
+            frame::deserialize_frame(&mut utils::make_result_stream(&SAMPLE_CRYPTO_FRAME[..]))
+                .unwrap();
+        let mut frames = Vec::<frame::Frame>::with_capacity(918);
+        frames.push(crypto_frame);
+        for _ in 0..917 {
+            frames.push(frame::Frame::Padding);
+        }
+        let mut connection = Connection::new(
+            false,
+            crate::version::Version::V1,
+            U160::from(9481424049684961032u64),
+            8,
+        )
+        .unwrap();
+        connection.set_scid(U160::zero(), 0);
+        let packet_number = 2u64;
+        let packet_number_bytes = vec![0u8, 0u8, 0u8, 2u8];
+        let header_byte = super::PacketInitial::new_header_byte(0x3u8);
+        let (destination_connection_id, destination_connection_id_length) = connection.get_dcid();
+        let (source_connection_id, source_connection_id_length) = connection.get_scid().unwrap();
+        let header = super::LongPacketHeader {
+            header_byte,
+            version: connection.get_version_field(),
+            destination_connection_id_length,
+            destination_connection_id,
+            source_connection_id_length,
+            source_connection_id,
+            version_negotiation: None,
+            is_protected: false,
+        };
+        let packet = super::PacketInitial {
+            header: header,
+            token: vec![],
+            packet_number,
+            packet_number_bytes,
+            packet_payload: frames,
+        };
+        let result = packet.serialize(&connection).unwrap();
+        let expected_result = SAMPLE_PACKET_DATA;
+        assert_eq!(
+            &result[..],
+            &expected_result[..],
+            "\nresult: {:X?},\nexpected_result: {:X?}",
+            result,
+            expected_result
+        );
+    }
     use ring::aead::quic as ring_quic;
 
     #[test]

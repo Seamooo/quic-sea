@@ -170,12 +170,13 @@ impl InternalQuicSocket {
         let rv = || -> U160 {
             loop {
                 let src_id = tls::get_connection_id();
+                let key = U160::from(src_id);
                 {
                     let mut streams = self.streams.write().unwrap();
-                    if !streams.contains_key(&src_id) {
-                        stream.connection.write().unwrap().set_scid(src_id);
-                        streams.insert(src_id.clone(), stream);
-                        return src_id;
+                    if !streams.contains_key(&key) {
+                        stream.connection.write().unwrap().set_scid(key, 8usize);
+                        streams.insert(key.clone(), stream);
+                        return key;
                     }
                 }
             }

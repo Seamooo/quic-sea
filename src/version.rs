@@ -11,7 +11,12 @@ pub enum Version {
 impl Version {
     pub fn get_kdf_initial_salt(&self) -> &'static [u8] {
         match self {
-            Version::V1 => KDF_INITIAL_SALT_V1,
+            Self::V1 => KDF_INITIAL_SALT_V1,
+        }
+    }
+    pub fn get_version_field_val(&self) -> u32 {
+        match self {
+            Self::V1 => 1u32,
         }
     }
 }
