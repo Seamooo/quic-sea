@@ -1,7 +1,7 @@
 use crate::connection::Connection;
 use crate::error::{self, Error};
 use crate::packet::{decode_packets, next_header_from_stream, Packet, PacketHeader, PacketType};
-use crate::tls;
+use crate::quictls;
 use crate::utils::{self, U160};
 use crate::version;
 use std::collections::HashMap;
@@ -169,7 +169,7 @@ impl InternalQuicSocket {
         let stream = InternalQuicStream::from_connection(connection);
         let rv = || -> U160 {
             loop {
-                let src_id = tls::get_connection_id();
+                let src_id = quictls::utils::get_connection_id();
                 let key = U160::from(src_id);
                 {
                     let mut streams = self.streams.write().unwrap();

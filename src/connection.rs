@@ -1,6 +1,6 @@
 use crate::error::{self, Error};
-use crate::tls;
-use crate::utils::{self, prelude::*};
+use crate::quictls;
+use crate::utils::prelude::*;
 use crate::version;
 
 #[derive(Debug)]
@@ -15,7 +15,8 @@ struct PacketNumberSpaceInfo {
     largest_remote_ack: Option<u64>,
     largest_local_ack: Option<u64>,
     next_pn: u64,
-    tls_secrets: Option<tls::Secrets>,
+    local_tls_secrets: Option<quictls::Secrets>,
+    remote_tls_secrets: Option<quictls::Secrets>,
 }
 
 impl PacketNumberSpaceInfo {
@@ -24,7 +25,8 @@ impl PacketNumberSpaceInfo {
             largest_remote_ack: None,
             largest_local_ack: None,
             next_pn: 0,
-            tls_secrets: None,
+            local_tls_secrets: None,
+            remote_tls_secrets: None,
         }
     }
 }
@@ -74,10 +76,18 @@ impl Connection {
         dcid: U160,
         dcid_len: usize,
     ) -> error::Result<Self> {
-        let initial_tls_secrets =
-            tls::Secrets::from_initial(is_server, &dcid.to_var_bytes(dcid_len)[..], &version)?;
+        let server_secrets =
+            quictls::Secrets::from_initial(true, &dcid.to_var_bytes(dcid_len)[..], &version)?;
+        let client_secrets =
+            quictls::Secrets::from_initial(false, &dcid.to_var_bytes(dcid_len)[..], &version)?;
+        let (local_tls_secrets, remote_tls_secrets) = if is_server {
+            (server_secrets, client_secrets)
+        } else {
+            (client_secrets, server_secrets)
+        };
         let mut initial_pn_info = PacketNumberSpaceInfo::new();
-        initial_pn_info.tls_secrets = Some(initial_tls_secrets);
+        initial_pn_info.local_tls_secrets = Some(local_tls_secrets);
+        initial_pn_info.remote_tls_secrets = Some(remote_tls_secrets);
         Ok(Self {
             version,
             initial_pn_info,
@@ -104,10 +114,17 @@ impl Connection {
         }
     }
 
-    fn borrow_tls_secrets(&self, pn_space: PacketNumberSpace) -> error::Result<&tls::Secrets> {
+    fn borrow_local_tls_secrets(&self, pn_space: PacketNumberSpace) -> error::Result<&quictls::Secrets> {
         let pn_info = self.borrow_pn_info(pn_space);
-        pn_info.tls_secrets.as_ref().ok_or(Error::InternalError(
-            "attempted to retrieve unset tls secrets",
+        pn_info.local_tls_secrets.as_ref().ok_or(Error::InternalError(
+            "attempted to retrieve unset local tls secrets",
+        ))
+    }
+
+    fn borrow_remote_tls_secrets(&self, pn_space: PacketNumberSpace) -> error::Result<&quictls::Secrets> {
+        let pn_info = self.borrow_pn_info(pn_space);
+        pn_info.remote_tls_secrets.as_ref().ok_or(Error::InternalError(
+            "attempted to retrieve unset remote tls secrets",
         ))
     }
 
@@ -133,12 +150,8 @@ impl Connection {
     where
         T: Iterator<Item = error::Result<u8>>,
     {
-        let tls_secrets = self.borrow_tls_secrets(pn_space)?;
-        let sample = utils::var_bytes_from_stream(
-            sample_stream,
-            tls_secrets.local.cipher_suite.sample_len(),
-        )?;
-        tls_secrets.local.get_header_protection_mask(&sample[..])
+        let tls_secrets = self.borrow_local_tls_secrets(pn_space)?;
+        tls_secrets.get_header_protection_mask(sample_stream)
     }
 
     pub fn get_remote_hp_mask<T>(
@@ -149,12 +162,8 @@ impl Connection {
     where
         T: Iterator<Item = error::Result<u8>>,
     {
-        let tls_secrets = self.borrow_tls_secrets(pn_space)?;
-        let sample = utils::var_bytes_from_stream(
-            sample_stream,
-            tls_secrets.remote.cipher_suite.sample_len(),
-        )?;
-        tls_secrets.remote.get_header_protection_mask(&sample[..])
+        let tls_secrets = self.borrow_remote_tls_secrets(pn_space)?;
+        tls_secrets.get_header_protection_mask(sample_stream)
     }
 
     pub fn decrypt_remote_payload(
@@ -164,10 +173,9 @@ impl Connection {
         associated_data: &[u8],
         packet_number: u64,
     ) -> error::Result<Vec<u8>> {
-        let tls_secrets = self.borrow_tls_secrets(pn_space)?;
+        let tls_secrets = self.borrow_remote_tls_secrets(pn_space)?;
         tls_secrets
-            .remote
-            .decrypt_payload(payload, associated_data, packet_number)
+            .decrypt_payload(payload, Some(associated_data), packet_number)
     }
     pub fn encrypt_local_payload(
         &self,
@@ -176,10 +184,9 @@ impl Connection {
         associated_data: &[u8],
         packet_number: u64,
     ) -> error::Result<Vec<u8>> {
-        let tls_secrets = self.borrow_tls_secrets(pn_space)?;
+        let tls_secrets = self.borrow_local_tls_secrets(pn_space)?;
         tls_secrets
-            .local
-            .encrypt_payload(payload, associated_data, packet_number)
+            .encrypt_payload(payload, Some(associated_data), packet_number)
     }
     pub fn reconstruct_remote_pn(
         &self,
@@ -217,8 +224,8 @@ impl Connection {
         pn_space: PacketNumberSpace,
         payload_len: usize,
     ) -> error::Result<usize> {
-        let tls_secrets = self.borrow_tls_secrets(pn_space)?;
-        Ok(tls_secrets.local.cipher_suite.tag_len() + payload_len)
+        let tls_secrets = self.borrow_local_tls_secrets(pn_space)?;
+        Ok(tls_secrets.get_protected_payload_len(payload_len))
     }
 
     /// Returns next packet number and the truncated encoding
